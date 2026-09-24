@@ -71,7 +71,6 @@ HBRUSH gDarkControlBrush = nullptr;
 constexpr COLORREF kDarkBackground = RGB(17, 19, 24);
 constexpr COLORREF kDarkControl = RGB(28, 32, 39);
 constexpr COLORREF kDarkText = RGB(228, 231, 236);
-constexpr COLORREF kDarkMutedText = RGB(174, 180, 191);
 
 std::atomic<bool> gZoneActive{false};
 std::atomic<HWND> gZoneTarget{nullptr};
@@ -2283,6 +2282,7 @@ void StopServer()
         shutdown(activeWebSocket, SD_BOTH);
     }
 
+    ReleaseActiveInputState();
     ShutdownOpenClientSockets();
 
     const SOCKET listener = gListenSocket.exchange(INVALID_SOCKET);
