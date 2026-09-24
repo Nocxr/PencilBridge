@@ -53,6 +53,32 @@ label.toggle {
     white-space: nowrap;
 }
 input[type=checkbox] { width: 20px; height: 20px; }
+.whiteboard-tools {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    color: #cfd5de;
+    font-size: 12px;
+}
+body.whiteboard-active .whiteboard-tools {
+    display: inline-flex;
+}
+.whiteboard-tools label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+}
+.whiteboard-tools input[type=range] {
+    width: 90px;
+}
+.whiteboard-tools input[type=color] {
+    width: 34px;
+    height: 28px;
+    border: 0;
+    padding: 0;
+    background: transparent;
+}
 .header-button {
     border: 1px solid #3a414d;
     border-radius: 7px;
@@ -248,6 +274,14 @@ body.markup-active .metrics {
     opacity: 1;
     transform: translate(-50%, -50%) scale(1);
 }
+body.whiteboard-active #pad {
+    box-shadow: inset 0 0 0 2px #ff41b4;
+}
+body.whiteboard-active #pressure::before {
+    content: "WHITEBOARD • ";
+    color: #ff41b4;
+}
+
 #pressure {
     position: absolute;
     left: 14px;
@@ -324,6 +358,11 @@ body.markup-active .metrics {
     <label class="toggle"><input id="rotateGesture" type="checkbox"> Rotate</label>
     <label class="toggle"><input id="keepAwake" type="checkbox"> Keep awake</label>
     <label class="toggle"><input id="whiteboardMode" type="checkbox"> Whiteboard</label>
+    <span id="whiteboardTools" class="whiteboard-tools">
+        <input id="whiteboardColor" type="color" value="#ff463c" aria-label="Whiteboard color">
+        <label>Size <input id="whiteboardSize" type="range" min="1" max="32" step="1" value="7"></label>
+        <output id="whiteboardSizeValue">7</output>
+    </span>
     <button id="whiteboardClip" class="header-button" type="button">Clip</button>
     <button id="whiteboardClear" class="header-button" type="button">Clear ink</button>
 </header>
@@ -350,6 +389,8 @@ body.markup-active .metrics {
 </div>
 
 <div id="gestureToast"></div>
+<video id="wakeFallbackVideo" playsinline aria-hidden="true"
+    style="position:fixed;width:2px;height:2px;opacity:0.01;pointer-events:none;left:-10px;top:-10px"></video>
 
 <section id="markupView">
     <div class="markup-toolbar">
@@ -385,8 +426,13 @@ body.markup-active .metrics {
     var rotateGesture = document.getElementById('rotateGesture');
     var keepAwake = document.getElementById('keepAwake');
     var whiteboardMode = document.getElementById('whiteboardMode');
+    var whiteboardTools = document.getElementById('whiteboardTools');
+    var whiteboardColor = document.getElementById('whiteboardColor');
+    var whiteboardSize = document.getElementById('whiteboardSize');
+    var whiteboardSizeValue = document.getElementById('whiteboardSizeValue');
     var whiteboardClip = document.getElementById('whiteboardClip');
     var whiteboardClear = document.getElementById('whiteboardClear');
+    var wakeFallbackVideo = document.getElementById('wakeFallbackVideo');
     var deviceText = document.getElementById('device');
     var pressureMetric = document.getElementById('pressureMetric');
     var pressureMax = document.getElementById('pressureMax');
@@ -436,6 +482,9 @@ body.markup-active .metrics {
     var nativePadStylusId = null;
     var toastTimer = null;
     var wakeLock = null;
+    var wakeFallbackStream = null;
+    var pinchLastDistance = null;
+    var pinchWheelAccumulator = 0;
 
     var GESTURE_MAX_MS = 420;
     var GESTURE_MOVE_PX = 28;
@@ -540,43 +589,92 @@ body.markup-active .metrics {
         endNativeGestureInjection();
     });
 
+    async function startWakeFallback() {
+        if (wakeFallbackStream) {
+            try {
+                await wakeFallbackVideo.play();
+                return true;
+            } catch (_) {
+                return false;
+            }
+        }
+
+        try {
+            var canvas = document.createElement('canvas');
+            canvas.width = 2;
+            canvas.height = 2;
+            var ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, 2, 2);
+
+            if (typeof canvas.captureStream !== 'function') {
+                return false;
+            }
+
+            wakeFallbackStream = canvas.captureStream(1);
+            wakeFallbackVideo.srcObject = wakeFallbackStream;
+            wakeFallbackVideo.playsInline = true;
+            wakeFallbackVideo.muted = false;
+            await wakeFallbackVideo.play();
+            return true;
+        } catch (_) {
+            wakeFallbackStream = null;
+            return false;
+        }
+    }
+
+    function stopWakeFallback() {
+        wakeFallbackVideo.pause();
+        if (wakeFallbackStream) {
+            wakeFallbackStream.getTracks().forEach(function (track) {
+                track.stop();
+            });
+        }
+        wakeFallbackStream = null;
+        wakeFallbackVideo.srcObject = null;
+    }
+
     async function acquireWakeLock() {
         if (!keepAwake.checked ||
             document.visibilityState !== 'visible') {
             return;
         }
 
-        if (!('wakeLock' in navigator) ||
-            !navigator.wakeLock ||
-            typeof navigator.wakeLock.request !== 'function') {
-            keepAwake.checked = false;
-            localStorage.setItem('pencilbridge.keepAwake', '0');
-            showGestureToast('WAKE LOCK UNSUPPORTED');
-            return;
+        if ('wakeLock' in navigator &&
+            navigator.wakeLock &&
+            typeof navigator.wakeLock.request === 'function') {
+            try {
+                if (!wakeLock) {
+                    wakeLock =
+                        await navigator.wakeLock.request('screen');
+                    wakeLock.addEventListener('release', function () {
+                        wakeLock = null;
+                    });
+                }
+                stopWakeFallback();
+                showGestureToast('KEEP AWAKE ON');
+                return;
+            } catch (_) {
+                wakeLock = null;
+            }
         }
 
-        try {
-            if (!wakeLock) {
-                wakeLock = await navigator.wakeLock.request('screen');
-                wakeLock.addEventListener('release', function () {
-                    wakeLock = null;
-                });
-            }
-        } catch (_) {
-            showGestureToast('WAKE LOCK FAILED');
-        }
+        var fallbackStarted = await startWakeFallback();
+        showGestureToast(
+            fallbackStarted
+                ? 'KEEP AWAKE FALLBACK'
+                : 'KEEP AWAKE NEEDS HTTPS');
     }
 
     async function releaseWakeLock() {
-        if (!wakeLock) {
-            return;
+        if (wakeLock) {
+            var current = wakeLock;
+            wakeLock = null;
+            try {
+                await current.release();
+            } catch (_) {}
         }
-
-        var current = wakeLock;
-        wakeLock = null;
-        try {
-            await current.release();
-        } catch (_) {}
+        stopWakeFallback();
     }
 
     keepAwake.addEventListener('change', function () {
@@ -591,7 +689,70 @@ body.markup-active .metrics {
         }
     });
 
+    function applyWhiteboardUiState(active) {
+        whiteboardMode.checked = active;
+        document.body.classList.toggle(
+            'whiteboard-active',
+            active);
+    }
+
+    function parseHexColor(value) {
+        var match = /^#([0-9a-f]{6})$/i.exec(value || '');
+        if (!match) {
+            return { r: 255, g: 70, b: 60 };
+        }
+        var packed = parseInt(match[1], 16);
+        return {
+            r: (packed >> 16) & 255,
+            g: (packed >> 8) & 255,
+            b: packed & 255
+        };
+    }
+
+    whiteboardColor.value =
+        localStorage.getItem('pencilbridge.whiteboardColor') ||
+        '#ff463c';
+    whiteboardSize.value = String(
+        Math.max(
+            1,
+            Math.min(
+                32,
+                loadNumber('pencilbridge.whiteboardSize', 7))));
+    whiteboardSizeValue.textContent = whiteboardSize.value;
+
+    function sendWhiteboardBrushSettings() {
+        var color = parseHexColor(whiteboardColor.value);
+        sendCommand(
+            'whiteboard,color,' +
+            color.r + ',' +
+            color.g + ',' +
+            color.b);
+        sendCommand(
+            'whiteboard,size,' +
+            whiteboardSize.value);
+    }
+
+    whiteboardColor.addEventListener('input', function () {
+        localStorage.setItem(
+            'pencilbridge.whiteboardColor',
+            whiteboardColor.value);
+        sendWhiteboardBrushSettings();
+    });
+
+    whiteboardSize.addEventListener('input', function () {
+        whiteboardSizeValue.textContent =
+            whiteboardSize.value;
+        localStorage.setItem(
+            'pencilbridge.whiteboardSize',
+            whiteboardSize.value);
+        sendWhiteboardBrushSettings();
+    });
+
     whiteboardMode.addEventListener('change', function () {
+        applyWhiteboardUiState(whiteboardMode.checked);
+        if (whiteboardMode.checked) {
+            sendWhiteboardBrushSettings();
+        }
         sendCommand(
             whiteboardMode.checked
                 ? 'whiteboard,on'
@@ -619,6 +780,9 @@ body.markup-active .metrics {
             }
         } else {
             wakeLock = null;
+            if (wakeFallbackStream) {
+                wakeFallbackVideo.pause();
+            }
         }
     });
 
@@ -683,6 +847,7 @@ body.markup-active .metrics {
 
         socket.addEventListener('open', function () {
             setConnection(true, 'Connected');
+            sendWhiteboardBrushSettings();
         });
 
         socket.addEventListener('close', function () {
@@ -700,7 +865,7 @@ body.markup-active .metrics {
                 if (parts.length === 3 &&
                     parts[0] === 'state' &&
                     parts[1] === 'whiteboard') {
-                    whiteboardMode.checked = parts[2] === '1';
+                    applyWhiteboardUiState(parts[2] === '1');
                 }
                 return;
             }
@@ -1469,6 +1634,69 @@ body.markup-active .metrics {
         ];
     }
 
+    function sendPinchZoomStep(steps, centerX, centerY) {
+        if (!socket ||
+            socket.readyState !== WebSocket.OPEN ||
+            steps === 0) {
+            return;
+        }
+
+        var point = normalized({
+            clientX: centerX,
+            clientY: centerY
+        });
+
+        socket.send(
+            'cmd,zoom,' +
+            String(steps) + ',' +
+            point.x.toFixed(6) + ',' +
+            point.y.toFixed(6));
+    }
+
+    function updatePinchZoom() {
+        if (!pinchZoom.checked ||
+            touchGesture.size !== 2) {
+            pinchLastDistance = null;
+            pinchWheelAccumulator = 0;
+            return;
+        }
+
+        var fingers = twoFingerEntries();
+        if (!fingers) {
+            return;
+        }
+
+        var dx = fingers[1].x - fingers[0].x;
+        var dy = fingers[1].y - fingers[0].y;
+        var distance = Math.hypot(dx, dy);
+        var centerX = (fingers[0].x + fingers[1].x) * 0.5;
+        var centerY = (fingers[0].y + fingers[1].y) * 0.5;
+
+        if (pinchLastDistance === null) {
+            pinchLastDistance = distance;
+            return;
+        }
+
+        pinchWheelAccumulator +=
+            distance - pinchLastDistance;
+        pinchLastDistance = distance;
+
+        var threshold = 7;
+        var steps = pinchWheelAccumulator >= 0
+            ? Math.floor(pinchWheelAccumulator / threshold)
+            : Math.ceil(pinchWheelAccumulator / threshold);
+
+        if (steps !== 0) {
+            pinchWheelAccumulator -= steps * threshold;
+            touchGestureCancelled = true;
+            touchGestureMoved = true;
+            sendPinchZoomStep(
+                Math.max(-4, Math.min(4, steps)),
+                centerX,
+                centerY);
+        }
+    }
+
     function angleDelta(a, b) {
         var delta = a - b;
         while (delta > Math.PI) delta -= Math.PI * 2;
@@ -1503,9 +1731,7 @@ body.markup-active .metrics {
         var startAngle = Math.atan2(startDy, startDx);
         var currentAngle = Math.atan2(currentDy, currentDx);
 
-        var distance = useStart || !pinchZoom.checked
-            ? startDistance
-            : currentDistance;
+        var distance = startDistance;
         var angle = useStart || !rotateGesture.checked
             ? startAngle
             : currentAngle;
@@ -1555,19 +1781,16 @@ body.markup-active .metrics {
         var startAngle = Math.atan2(startDy, startDx);
         var currentAngle = Math.atan2(currentDy, currentDx);
 
-        var pinchMoved =
-            pinchZoom.checked &&
-            Math.abs(currentDistance - startDistance) >= 7;
         var rotateMoved =
             rotateGesture.checked &&
             Math.abs(angleDelta(currentAngle, startAngle)) >=
                 (4 * Math.PI / 180);
 
-        return pinchMoved || rotateMoved;
+        return rotateMoved;
     }
 
     function updateNativeGestureInjection() {
-        if ((!pinchZoom.checked && !rotateGesture.checked) ||
+        if (!rotateGesture.checked ||
             touchGesture.size !== 2) {
             return;
         }
@@ -1622,6 +1845,8 @@ body.markup-active .metrics {
     function beginTouchGesture(event) {
         if (touchGesture.size === 0) {
             endNativeGestureInjection();
+            pinchLastDistance = null;
+            pinchWheelAccumulator = 0;
             touchGestureStart = performance.now();
             touchGestureMaxCount = 0;
             touchGestureMoved = false;
@@ -1669,6 +1894,7 @@ body.markup-active .metrics {
             touchGestureMoved = true;
         }
 
+        updatePinchZoom();
         updateNativeGestureInjection();
     }
 
@@ -1709,6 +1935,8 @@ body.markup-active .metrics {
         touchGestureMaxCount = 0;
         touchGestureMoved = false;
         touchGestureCancelled = false;
+        pinchLastDistance = null;
+        pinchWheelAccumulator = 0;
         return wasMultiTouch || recognized;
     }
 
@@ -2230,6 +2458,7 @@ body.markup-active .metrics {
         }, 50);
     });
 
+    applyWhiteboardUiState(false);
     refreshPadRect();
     requestAnimationFrame(telemetryFrame);
 
