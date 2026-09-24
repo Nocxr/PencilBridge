@@ -49,8 +49,7 @@ if (!$root) {
         KeyUsage = @("CertSign", "CRLSign", "DigitalSignature")
         NotAfter = $now.AddYears(10)
         TextExtension = @(
-            "2.5.29.19={critical}{text}ca=1&pathlength=1",
-            "2.5.29.15={critical}{text}keyCertSign,cRLSign"
+            "2.5.29.19={critical}{text}ca=1&pathlength=1"
         )
     }
     $root = New-SelfSignedCertificate @rootArgs

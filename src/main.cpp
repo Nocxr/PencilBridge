@@ -17,6 +17,7 @@
 #include <charconv>
 #include <cmath>
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -483,6 +484,40 @@ std::string GetLocalIPv4()
 
     freeaddrinfo(results);
     return best;
+}
+
+std::string GetConfiguredServerIPv4()
+{
+    std::ifstream file(
+        "Saved/PencilBridge/TLS/server-ip.txt",
+        std::ios::binary);
+    if (file)
+    {
+        std::string configured{
+            std::istreambuf_iterator<char>(file),
+            std::istreambuf_iterator<char>()};
+
+        while (!configured.empty() &&
+               (configured.back() == '\r' ||
+                configured.back() == '\n' ||
+                configured.back() == ' ' ||
+                configured.back() == '\t'))
+        {
+            configured.pop_back();
+        }
+
+        sockaddr_in address{};
+        if (!configured.empty() &&
+            inet_pton(
+                AF_INET,
+                configured.c_str(),
+                &address.sin_addr) == 1)
+        {
+            return configured;
+        }
+    }
+
+    return GetLocalIPv4();
 }
 
 bool RawSendAll(SOCKET socket, const char* data, size_t size)
@@ -3386,7 +3421,7 @@ void BootstrapServerMain()
         return;
     }
 
-    const std::string ip = GetLocalIPv4();
+    const std::string ip = GetConfiguredServerIPv4();
 
     while (gRunning.load())
     {
@@ -3465,7 +3500,7 @@ void ServerMain()
         return;
     }
 
-    const std::string ip = GetLocalIPv4();
+    const std::string ip = GetConfiguredServerIPv4();
     const std::wstring ready =
         L"HTTPS ready: https://" +
         std::wstring(ip.begin(), ip.end()) +
@@ -4911,7 +4946,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     std::string ip = "127.0.0.1";
     if (WSAStartup(MAKEWORD(2, 2), &addressWsa) == 0)
     {
-        ip = GetLocalIPv4();
+        ip = GetConfiguredServerIPv4();
         WSACleanup();
     }
 
