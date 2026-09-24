@@ -32,7 +32,12 @@ namespace
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
 constexpr int ID_TARGET_COMBO = 1001;
 constexpr int ID_REFRESH_BUTTON = 1002;
+constexpr int ID_SELECT_ZONE_BUTTON = 1003;
+constexpr int ID_CLEAR_ZONE_BUTTON = 1004;
+constexpr UINT_PTR ID_ZONE_TRACK_TIMER = 2001;
 constexpr int kPort = 8765;
+constexpr wchar_t kZoneSelectClassName[] = L"PencilBridgeZoneSelect";
+constexpr wchar_t kZoneOutlineClassName[] = L"PencilBridgeZoneOutline";
 
 struct WindowEntry
 {
@@ -44,6 +49,22 @@ HWND gMainWindow = nullptr;
 HWND gTargetCombo = nullptr;
 HWND gUrlText = nullptr;
 HWND gStatusText = nullptr;
+HWND gZoneText = nullptr;
+HWND gZoneSelectWindow = nullptr;
+HWND gZoneOutlineWindow = nullptr;
+HWND gZoneOutlineOwner = nullptr;
+HINSTANCE gInstance = nullptr;
+
+std::atomic<bool> gZoneActive{false};
+std::atomic<HWND> gZoneTarget{nullptr};
+std::atomic<double> gZoneX{0.0};
+std::atomic<double> gZoneY{0.0};
+std::atomic<double> gZoneWidth{1.0};
+std::atomic<double> gZoneHeight{1.0};
+
+bool gZoneDragging = false;
+POINT gZoneDragStart{};
+POINT gZoneDragCurrent{};
 
 std::vector<WindowEntry> gWindows;
 std::atomic<HWND> gTargetWindow{nullptr};
@@ -158,6 +179,10 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM)
     return TRUE;
 }
 
+void ClearZone();
+void UpdateZoneOutline();
+void BeginZoneSelection();
+
 bool ActivateTargetWindow(HWND target)
 {
     if (!target || !IsWindow(target))
@@ -184,7 +209,13 @@ void SelectComboIndex(int index, bool activate)
     }
 
     const HWND target = gWindows[static_cast<size_t>(index)].hwnd;
-    gTargetWindow.store(target);
+    const HWND previousTarget = gTargetWindow.exchange(target);
+
+    if (previousTarget && previousTarget != target &&
+        gZoneActive.load(std::memory_order_relaxed))
+    {
+        ClearZone();
+    }
 
     if (activate)
     {
@@ -492,7 +523,17 @@ HWND TopLevelWindowAtPoint(POINT point)
 
 bool PointBelongsToTarget(POINT point, HWND target)
 {
-    return TopLevelWindowAtPoint(point) == target;
+    const HWND top = TopLevelWindowAtPoint(point);
+    if (top == target)
+    {
+        return true;
+    }
+
+    // The persistent zone outline is click-through, but WindowFromPoint can still
+    // report it on some systems. Treat its thin border as belonging to its owner.
+    return top == gZoneOutlineWindow &&
+           gZoneActive.load(std::memory_order_relaxed) &&
+           gZoneTarget.load(std::memory_order_relaxed) == target;
 }
 
 bool CaptureTargetGeometry(HWND target, TargetGeometry& geometry)
@@ -547,6 +588,17 @@ bool MapWithGeometry(
 
     normalizedX = std::clamp(normalizedX, 0.0, 1.0);
     normalizedY = std::clamp(normalizedY, 0.0, 1.0);
+
+    if (gZoneActive.load(std::memory_order_relaxed) &&
+        gZoneTarget.load(std::memory_order_relaxed) == geometry.target)
+    {
+        const double zoneX = gZoneX.load(std::memory_order_relaxed);
+        const double zoneY = gZoneY.load(std::memory_order_relaxed);
+        const double zoneWidth = gZoneWidth.load(std::memory_order_relaxed);
+        const double zoneHeight = gZoneHeight.load(std::memory_order_relaxed);
+        normalizedX = zoneX + normalizedX * zoneWidth;
+        normalizedY = zoneY + normalizedY * zoneHeight;
+    }
 
     outPoint.x =
         geometry.origin.x +
@@ -1219,6 +1271,377 @@ void ServerMain()
     WSACleanup();
 }
 
+
+void DestroyZoneSelector()
+{
+    if (gZoneSelectWindow)
+    {
+        HWND window = gZoneSelectWindow;
+        gZoneSelectWindow = nullptr;
+        DestroyWindow(window);
+    }
+    gZoneDragging = false;
+}
+
+void SetZoneStatusText()
+{
+    if (!gZoneText)
+    {
+        return;
+    }
+
+    if (!gZoneActive.load(std::memory_order_relaxed))
+    {
+        SetWindowTextW(gZoneText, L"Zone: full window");
+        return;
+    }
+
+    const int left = static_cast<int>(std::lround(gZoneX.load(std::memory_order_relaxed) * 100.0));
+    const int top = static_cast<int>(std::lround(gZoneY.load(std::memory_order_relaxed) * 100.0));
+    const int width = static_cast<int>(std::lround(gZoneWidth.load(std::memory_order_relaxed) * 100.0));
+    const int height = static_cast<int>(std::lround(gZoneHeight.load(std::memory_order_relaxed) * 100.0));
+
+    const std::wstring text =
+        L"Zone: " + std::to_wstring(width) + L"% x " + std::to_wstring(height) +
+        L"%  @ " + std::to_wstring(left) + L"%, " + std::to_wstring(top) + L"%";
+    SetWindowTextW(gZoneText, text.c_str());
+}
+
+void DestroyZoneOutline()
+{
+    if (gZoneOutlineWindow)
+    {
+        HWND window = gZoneOutlineWindow;
+        gZoneOutlineWindow = nullptr;
+        gZoneOutlineOwner = nullptr;
+        DestroyWindow(window);
+    }
+}
+
+void ClearZone()
+{
+    gZoneActive.store(false, std::memory_order_relaxed);
+    gZoneTarget.store(nullptr, std::memory_order_relaxed);
+    gZoneX.store(0.0, std::memory_order_relaxed);
+    gZoneY.store(0.0, std::memory_order_relaxed);
+    gZoneWidth.store(1.0, std::memory_order_relaxed);
+    gZoneHeight.store(1.0, std::memory_order_relaxed);
+    gPenTargetGeometry.valid = false;
+    DestroyZoneSelector();
+    DestroyZoneOutline();
+    SetZoneStatusText();
+}
+
+LRESULT CALLBACK ZoneOutlineProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT rect{};
+        GetClientRect(hwnd, &rect);
+
+        const COLORREF keyColor = RGB(1, 2, 3);
+        HBRUSH background = CreateSolidBrush(keyColor);
+        FillRect(dc, &rect, background);
+        DeleteObject(background);
+
+        HPEN pen = CreatePen(PS_SOLID, 3, RGB(0, 220, 255));
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, 2, 2, std::max(3L, rect.right - 2), std::max(3L, rect.bottom - 2));
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
+
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void UpdateZoneOutline()
+{
+    if (!gZoneActive.load(std::memory_order_relaxed))
+    {
+        if (gZoneOutlineWindow)
+        {
+            ShowWindow(gZoneOutlineWindow, SW_HIDE);
+        }
+        return;
+    }
+
+    const HWND target = gZoneTarget.load(std::memory_order_relaxed);
+    if (!target || !IsWindow(target) || !IsWindowVisible(target) || IsIconic(target))
+    {
+        if (gZoneOutlineWindow)
+        {
+            ShowWindow(gZoneOutlineWindow, SW_HIDE);
+        }
+        return;
+    }
+
+    TargetGeometry geometry;
+    if (!CaptureTargetGeometry(target, geometry))
+    {
+        return;
+    }
+
+    if (!gZoneOutlineWindow || gZoneOutlineOwner != target)
+    {
+        DestroyZoneOutline();
+
+        gZoneOutlineWindow = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            kZoneOutlineClassName,
+            L"",
+            WS_POPUP,
+            0, 0, 1, 1,
+            target,
+            nullptr,
+            gInstance,
+            nullptr);
+
+        if (!gZoneOutlineWindow)
+        {
+            return;
+        }
+
+        gZoneOutlineOwner = target;
+        SetLayeredWindowAttributes(gZoneOutlineWindow, RGB(1, 2, 3), 255, LWA_COLORKEY);
+    }
+
+    const double zoneX = gZoneX.load(std::memory_order_relaxed);
+    const double zoneY = gZoneY.load(std::memory_order_relaxed);
+    const double zoneWidth = gZoneWidth.load(std::memory_order_relaxed);
+    const double zoneHeight = gZoneHeight.load(std::memory_order_relaxed);
+
+    const int left =
+        geometry.origin.x +
+        static_cast<int>(std::lround(zoneX * static_cast<double>(geometry.width)));
+    const int top =
+        geometry.origin.y +
+        static_cast<int>(std::lround(zoneY * static_cast<double>(geometry.height)));
+    const int right =
+        geometry.origin.x +
+        static_cast<int>(std::lround((zoneX + zoneWidth) * static_cast<double>(geometry.width)));
+    const int bottom =
+        geometry.origin.y +
+        static_cast<int>(std::lround((zoneY + zoneHeight) * static_cast<double>(geometry.height)));
+
+    constexpr int margin = 4;
+    SetWindowPos(
+        gZoneOutlineWindow,
+        HWND_TOP,
+        left - margin,
+        top - margin,
+        std::max(8, right - left + margin * 2),
+        std::max(8, bottom - top + margin * 2),
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(gZoneOutlineWindow, nullptr, FALSE);
+}
+
+void CompleteZoneSelection(HWND hwnd)
+{
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+
+    const int left = std::clamp(std::min(gZoneDragStart.x, gZoneDragCurrent.x), 0, width);
+    const int right = std::clamp(std::max(gZoneDragStart.x, gZoneDragCurrent.x), 0, width);
+    const int top = std::clamp(std::min(gZoneDragStart.y, gZoneDragCurrent.y), 0, height);
+    const int bottom = std::clamp(std::max(gZoneDragStart.y, gZoneDragCurrent.y), 0, height);
+
+    if (right - left < 12 || bottom - top < 12 || width <= 0 || height <= 0)
+    {
+        DestroyZoneSelector();
+        UpdateZoneOutline();
+        PostStatus(L"Zone selection cancelled: drag a larger rectangle.");
+        return;
+    }
+
+    const HWND target = gTargetWindow.load();
+    gZoneTarget.store(target, std::memory_order_relaxed);
+    gZoneX.store(static_cast<double>(left) / static_cast<double>(width), std::memory_order_relaxed);
+    gZoneY.store(static_cast<double>(top) / static_cast<double>(height), std::memory_order_relaxed);
+    gZoneWidth.store(static_cast<double>(right - left) / static_cast<double>(width), std::memory_order_relaxed);
+    gZoneHeight.store(static_cast<double>(bottom - top) / static_cast<double>(height), std::memory_order_relaxed);
+    gZoneActive.store(true, std::memory_order_release);
+    gPenTargetGeometry.valid = false;
+
+    DestroyZoneSelector();
+    SetZoneStatusText();
+    UpdateZoneOutline();
+    ActivateTargetWindow(target);
+    PostStatus(L"Input zone selected. PencilBridge now maps the iPad into the outlined region.");
+}
+
+LRESULT CALLBACK ZoneSelectProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_LBUTTONDOWN:
+        gZoneDragging = true;
+        gZoneDragStart = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        gZoneDragCurrent = gZoneDragStart;
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (gZoneDragging)
+        {
+            gZoneDragCurrent = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (gZoneDragging)
+        {
+            gZoneDragCurrent = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            gZoneDragging = false;
+            ReleaseCapture();
+            CompleteZoneSelection(hwnd);
+        }
+        return 0;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE)
+        {
+            DestroyZoneSelector();
+            UpdateZoneOutline();
+            PostStatus(L"Zone selection cancelled.");
+            return 0;
+        }
+        break;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT rect{};
+        GetClientRect(hwnd, &rect);
+
+        HBRUSH background = CreateSolidBrush(RGB(18, 22, 28));
+        FillRect(dc, &rect, background);
+        DeleteObject(background);
+
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        RECT instruction = rect;
+        instruction.top += 16;
+        DrawTextW(
+            dc,
+            L"Drag to define the PencilBridge input zone  |  Esc to cancel",
+            -1,
+            &instruction,
+            DT_CENTER | DT_TOP | DT_SINGLELINE);
+
+        if (gZoneDragging)
+        {
+            RECT selection{
+                std::min(gZoneDragStart.x, gZoneDragCurrent.x),
+                std::min(gZoneDragStart.y, gZoneDragCurrent.y),
+                std::max(gZoneDragStart.x, gZoneDragCurrent.x),
+                std::max(gZoneDragStart.y, gZoneDragCurrent.y)};
+
+            HBRUSH fill = CreateSolidBrush(RGB(0, 100, 120));
+            FillRect(dc, &selection, fill);
+            DeleteObject(fill);
+
+            HPEN pen = CreatePen(PS_SOLID, 3, RGB(0, 240, 255));
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+            HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+            Rectangle(dc, selection.left, selection.top, selection.right, selection.bottom);
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
+        }
+
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void BeginZoneSelection()
+{
+    const HWND target = gTargetWindow.load();
+    if (!target || !IsWindow(target) || !IsWindowVisible(target))
+    {
+        PostStatus(L"Select a valid target window first.");
+        return;
+    }
+
+    ActivateTargetWindow(target);
+
+    TargetGeometry geometry;
+    if (!CaptureTargetGeometry(target, geometry))
+    {
+        PostStatus(L"Could not determine the target client area.");
+        return;
+    }
+
+    if (gZoneOutlineWindow)
+    {
+        ShowWindow(gZoneOutlineWindow, SW_HIDE);
+    }
+
+    DestroyZoneSelector();
+    gZoneDragging = false;
+
+    gZoneSelectWindow = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+        kZoneSelectClassName,
+        L"",
+        WS_POPUP | WS_VISIBLE,
+        geometry.origin.x,
+        geometry.origin.y,
+        geometry.width,
+        geometry.height,
+        target,
+        nullptr,
+        gInstance,
+        nullptr);
+
+    if (!gZoneSelectWindow)
+    {
+        UpdateZoneOutline();
+        PostStatus(L"Could not create the zone selector overlay.");
+        return;
+    }
+
+    SetLayeredWindowAttributes(gZoneSelectWindow, 0, 150, LWA_ALPHA);
+    SetWindowPos(
+        gZoneSelectWindow,
+        HWND_TOP,
+        geometry.origin.x,
+        geometry.origin.y,
+        geometry.width,
+        geometry.height,
+        SWP_SHOWWINDOW);
+    SetForegroundWindow(gZoneSelectWindow);
+    SetFocus(gZoneSelectWindow);
+    PostStatus(L"Drag over the part of the target window you want the iPad to control.");
+}
+
 void StopServer()
 {
     gRunning.store(false);
@@ -1262,30 +1685,53 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             570, 44, 100, 28,
             hwnd, reinterpret_cast<HMENU>(ID_REFRESH_BUTTON), nullptr, nullptr);
 
+        HWND selectZone = CreateWindowExW(
+            0, L"BUTTON", L"Select Zone",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            20, 82, 110, 28,
+            hwnd, reinterpret_cast<HMENU>(ID_SELECT_ZONE_BUTTON), nullptr, nullptr);
+
+        HWND clearZone = CreateWindowExW(
+            0, L"BUTTON", L"Clear Zone",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            140, 82, 100, 28,
+            hwnd, reinterpret_cast<HMENU>(ID_CLEAR_ZONE_BUTTON), nullptr, nullptr);
+
+        gZoneText = CreateWindowExW(
+            0, L"STATIC", L"Zone: full window",
+            WS_CHILD | WS_VISIBLE,
+            255, 87, 415, 20,
+            hwnd, nullptr, nullptr, nullptr);
+
         HWND urlLabel = CreateWindowExW(
             0, L"STATIC", L"Open this on the iPad (same LAN):",
             WS_CHILD | WS_VISIBLE,
-            20, 92, 260, 20,
+            20, 126, 260, 20,
             hwnd, nullptr, nullptr, nullptr);
 
         gUrlText = CreateWindowExW(
             0, L"STATIC", L"Starting server...",
             WS_CHILD | WS_VISIBLE,
-            20, 116, 650, 24,
+            20, 150, 650, 24,
             hwnd, nullptr, nullptr, nullptr);
 
         gStatusText = CreateWindowExW(
             0, L"STATIC", L"Starting...",
             WS_CHILD | WS_VISIBLE,
-            20, 158, 650, 44,
+            20, 190, 650, 44,
             hwnd, nullptr, nullptr, nullptr);
 
         ApplyDefaultFont(label);
         ApplyDefaultFont(gTargetCombo);
         ApplyDefaultFont(refresh);
+        ApplyDefaultFont(selectZone);
+        ApplyDefaultFont(clearZone);
+        ApplyDefaultFont(gZoneText);
         ApplyDefaultFont(urlLabel);
         ApplyDefaultFont(gUrlText);
         ApplyDefaultFont(gStatusText);
+
+        SetTimer(hwnd, ID_ZONE_TRACK_TIMER, 100, nullptr);
         return 0;
     }
 
@@ -1301,6 +1747,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             SelectComboIndex(index, true);
             return 0;
         }
+        if (LOWORD(wParam) == ID_SELECT_ZONE_BUTTON && HIWORD(wParam) == BN_CLICKED)
+        {
+            BeginZoneSelection();
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_CLEAR_ZONE_BUTTON && HIWORD(wParam) == BN_CLICKED)
+        {
+            ClearZone();
+            PostStatus(L"Input zone cleared. Mapping uses the full target client area.");
+            return 0;
+        }
+        break;
+
+    case WM_TIMER:
+        if (wParam == ID_ZONE_TRACK_TIMER)
+        {
+            UpdateZoneOutline();
+            return 0;
+        }
         break;
 
     case WM_DISPLAYCHANGE:
@@ -1313,8 +1778,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         MoveWindow(gTargetCombo, 20, 44, std::max(180, width - 150), 300, TRUE);
         HWND refresh = GetDlgItem(hwnd, ID_REFRESH_BUTTON);
         MoveWindow(refresh, std::max(20, width - 120), 44, 100, 28, TRUE);
-        MoveWindow(gUrlText, 20, 116, std::max(100, width - 40), 24, TRUE);
-        MoveWindow(gStatusText, 20, 158, std::max(100, width - 40), 44, TRUE);
+        MoveWindow(gZoneText, 255, 87, std::max(100, width - 275), 20, TRUE);
+        MoveWindow(gUrlText, 20, 150, std::max(100, width - 40), 24, TRUE);
+        MoveWindow(gStatusText, 20, 190, std::max(100, width - 40), 44, TRUE);
         return 0;
     }
 
@@ -1330,6 +1796,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
 
     case WM_DESTROY:
+        KillTimer(hwnd, ID_ZONE_TRACK_TIMER);
+        DestroyZoneSelector();
+        DestroyZoneOutline();
         StopServer();
         PostQuitMessage(0);
         return 0;
@@ -1341,6 +1810,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 {
+    gInstance = instance;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     RefreshVirtualDesktopGeometry();
 
@@ -1361,6 +1831,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         return 1;
     }
 
+    WNDCLASSW zoneSelectClass{};
+    zoneSelectClass.lpfnWndProc = ZoneSelectProc;
+    zoneSelectClass.hInstance = instance;
+    zoneSelectClass.lpszClassName = kZoneSelectClassName;
+    zoneSelectClass.hCursor = LoadCursor(nullptr, IDC_CROSS);
+    zoneSelectClass.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+
+    WNDCLASSW zoneOutlineClass{};
+    zoneOutlineClass.lpfnWndProc = ZoneOutlineProc;
+    zoneOutlineClass.hInstance = instance;
+    zoneOutlineClass.lpszClassName = kZoneOutlineClassName;
+    zoneOutlineClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    zoneOutlineClass.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+
+    if (!RegisterClassW(&zoneSelectClass) || !RegisterClassW(&zoneOutlineClass))
+    {
+        MessageBoxW(nullptr, L"Could not register PencilBridge zone overlay classes.", L"PencilBridge", MB_ICONERROR);
+        return 1;
+    }
+
     gMainWindow = CreateWindowExW(
         0,
         kClassName,
@@ -1369,7 +1859,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         720,
-        270,
+        320,
         nullptr,
         nullptr,
         instance,
