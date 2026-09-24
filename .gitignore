@@ -1,1 +1,15 @@
-
+build/
+out/
+.vs/
+.idea/
+.vscode/
+CMakeSettings.json
+CMakeUserPresets.json
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.pdb
+*.obj
+*.ilk
+*.exe
