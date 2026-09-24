@@ -45,10 +45,14 @@ constexpr int ID_CLEAR_ZONE_BUTTON = 1004;
 constexpr int ID_SEND_CLIPBOARD_BUTTON = 1005;
 constexpr int ID_AUTO_CLIPBOARD_CHECK = 1006;
 constexpr int ID_SELECT_SCREEN_RECT_BUTTON = 1007;
+constexpr int ID_WHITEBOARD_TOGGLE = 1008;
+constexpr int ID_WHITEBOARD_CLIP = 1009;
+constexpr int ID_WHITEBOARD_CLEAR = 1010;
 constexpr UINT_PTR ID_ZONE_TRACK_TIMER = 2001;
 constexpr int kPort = 8765;
 constexpr wchar_t kZoneSelectClassName[] = L"PencilBridgeZoneSelect";
 constexpr wchar_t kZoneOutlineClassName[] = L"PencilBridgeZoneOutline";
+constexpr wchar_t kWhiteboardClassName[] = L"PencilBridgeWhiteboardOverlay";
 
 struct WindowEntry
 {
@@ -65,6 +69,8 @@ HWND gAutoClipboardCheck = nullptr;
 HWND gZoneSelectWindow = nullptr;
 HWND gZoneOutlineWindow = nullptr;
 HWND gZoneOutlineOwner = nullptr;
+HWND gWhiteboardWindow = nullptr;
+HWND gWhiteboardToggle = nullptr;
 HINSTANCE gInstance = nullptr;
 HBRUSH gDarkBackgroundBrush = nullptr;
 HBRUSH gDarkControlBrush = nullptr;
@@ -85,6 +91,22 @@ std::atomic<int> gScreenRectLeft{0};
 std::atomic<int> gScreenRectTop{0};
 std::atomic<int> gScreenRectWidth{1};
 std::atomic<int> gScreenRectHeight{1};
+
+struct WhiteboardSegment
+{
+    double x1 = 0.0;
+    double y1 = 0.0;
+    double x2 = 0.0;
+    double y2 = 0.0;
+    int width = 4;
+};
+
+std::atomic<bool> gWhiteboardActive{false};
+std::mutex gWhiteboardMutex;
+std::vector<WhiteboardSegment> gWhiteboardSegments;
+bool gWhiteboardStrokeActive = false;
+double gWhiteboardLastX = 0.0;
+double gWhiteboardLastY = 0.0;
 
 bool gSelectingScreenRect = false;
 bool gZoneDragging = false;
@@ -285,6 +307,10 @@ void ClearZone();
 void UpdateZoneOutline();
 void BeginZoneSelection();
 void BeginScreenRectSelection();
+void UpdateWhiteboardOverlay();
+void SetWhiteboardActive(bool active);
+void ClearWhiteboardInk();
+void ClipWhiteboardToClipboard();
 
 bool ActivateTargetWindow(HWND target)
 {
@@ -1129,6 +1155,71 @@ bool MapWithGeometry(
     return true;
 }
 
+bool GetCurrentMappingRect(RECT& rect)
+{
+    if (gScreenRectActive.load(std::memory_order_relaxed))
+    {
+        const int left =
+            gScreenRectLeft.load(std::memory_order_relaxed);
+        const int top =
+            gScreenRectTop.load(std::memory_order_relaxed);
+        const int width = std::max(
+            1,
+            gScreenRectWidth.load(std::memory_order_relaxed));
+        const int height = std::max(
+            1,
+            gScreenRectHeight.load(std::memory_order_relaxed));
+
+        rect = {
+            left,
+            top,
+            left + width,
+            top + height
+        };
+        return true;
+    }
+
+    TargetGeometry geometry;
+    const HWND target = gTargetWindow.load();
+    if (!CaptureTargetGeometry(target, geometry))
+    {
+        return false;
+    }
+
+    double leftN = 0.0;
+    double topN = 0.0;
+    double widthN = 1.0;
+    double heightN = 1.0;
+
+    if (gZoneActive.load(std::memory_order_relaxed) &&
+        gZoneTarget.load(std::memory_order_relaxed) == target)
+    {
+        leftN = gZoneX.load(std::memory_order_relaxed);
+        topN = gZoneY.load(std::memory_order_relaxed);
+        widthN = gZoneWidth.load(std::memory_order_relaxed);
+        heightN = gZoneHeight.load(std::memory_order_relaxed);
+    }
+
+    rect.left =
+        geometry.origin.x +
+        static_cast<LONG>(std::lround(
+            leftN * static_cast<double>(geometry.width)));
+    rect.top =
+        geometry.origin.y +
+        static_cast<LONG>(std::lround(
+            topN * static_cast<double>(geometry.height)));
+    rect.right =
+        geometry.origin.x +
+        static_cast<LONG>(std::lround(
+            (leftN + widthN) * static_cast<double>(geometry.width)));
+    rect.bottom =
+        geometry.origin.y +
+        static_cast<LONG>(std::lround(
+            (topN + heightN) * static_cast<double>(geometry.height)));
+
+    return rect.right > rect.left && rect.bottom > rect.top;
+}
+
 bool MapToScreenRect(
     double normalizedX,
     double normalizedY,
@@ -1551,6 +1642,33 @@ bool ProcessCommandMessage(std::string_view message)
         return true;
     }
 
+    if (message == "cmd,whiteboard,on")
+    {
+        SetWhiteboardActive(true);
+        return true;
+    }
+    if (message == "cmd,whiteboard,off")
+    {
+        SetWhiteboardActive(false);
+        return true;
+    }
+    if (message == "cmd,whiteboard,toggle")
+    {
+        SetWhiteboardActive(
+            !gWhiteboardActive.load(std::memory_order_relaxed));
+        return true;
+    }
+    if (message == "cmd,whiteboard,clear")
+    {
+        ClearWhiteboardInk();
+        return true;
+    }
+    if (message == "cmd,whiteboard,clip")
+    {
+        ClipWhiteboardToClipboard();
+        return true;
+    }
+
     return false;
 }
 
@@ -1752,6 +1870,50 @@ void InjectGestureTouch(const InputEvent& event, POINT point, HWND target)
     }
 }
 
+void DrawWhiteboardInput(const InputEvent& event)
+{
+    if (!gWhiteboardActive.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    std::lock_guard lock(gWhiteboardMutex);
+
+    if (event.phase == 'd')
+    {
+        gWhiteboardStrokeActive = true;
+        gWhiteboardLastX = event.x;
+        gWhiteboardLastY = event.y;
+    }
+    else if (event.phase == 'm' && gWhiteboardStrokeActive)
+    {
+        const int width =
+            std::clamp(
+                2 + static_cast<int>(std::lround(event.pressure * 10.0)),
+                2,
+                12);
+
+        gWhiteboardSegments.push_back({
+            gWhiteboardLastX,
+            gWhiteboardLastY,
+            event.x,
+            event.y,
+            width});
+
+        gWhiteboardLastX = event.x;
+        gWhiteboardLastY = event.y;
+    }
+    else if (event.phase == 'u' || event.phase == 'c')
+    {
+        gWhiteboardStrokeActive = false;
+    }
+
+    if (gWhiteboardWindow)
+    {
+        InvalidateRect(gWhiteboardWindow, nullptr, FALSE);
+    }
+}
+
 void ProcessInputMessage(const std::string& message)
 {
     if (ProcessCommandMessage(message))
@@ -1761,6 +1923,19 @@ void ProcessInputMessage(const std::string& message)
 
     InputEvent event;
     if (!ParseInputEvent(message, event))
+    {
+        return;
+    }
+
+    if (gWhiteboardActive.load(std::memory_order_relaxed) &&
+        event.device == 'p')
+    {
+        DrawWhiteboardInput(event);
+        return;
+    }
+
+    if (gWhiteboardActive.load(std::memory_order_relaxed) &&
+        event.device == 'g')
     {
         return;
     }
@@ -2145,6 +2320,321 @@ void ServerMain()
 }
 
 
+LRESULT CALLBACK WhiteboardProc(
+    HWND hwnd,
+    UINT message,
+    WPARAM,
+    LPARAM)
+{
+    switch (message)
+    {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+
+        RECT rect{};
+        GetClientRect(hwnd, &rect);
+
+        const COLORREF keyColor = RGB(1, 2, 3);
+        HBRUSH background = CreateSolidBrush(keyColor);
+        FillRect(dc, &rect, background);
+        DeleteObject(background);
+
+        const int width = std::max(1L, rect.right - rect.left);
+        const int height = std::max(1L, rect.bottom - rect.top);
+
+        std::lock_guard lock(gWhiteboardMutex);
+        for (const WhiteboardSegment& segment : gWhiteboardSegments)
+        {
+            HPEN pen = CreatePen(
+                PS_SOLID,
+                segment.width,
+                RGB(255, 70, 60));
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+
+            MoveToEx(
+                dc,
+                static_cast<int>(std::lround(
+                    segment.x1 * static_cast<double>(width - 1))),
+                static_cast<int>(std::lround(
+                    segment.y1 * static_cast<double>(height - 1))),
+                nullptr);
+            LineTo(
+                dc,
+                static_cast<int>(std::lround(
+                    segment.x2 * static_cast<double>(width - 1))),
+                static_cast<int>(std::lround(
+                    segment.y2 * static_cast<double>(height - 1))));
+
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
+        }
+
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hwnd, message, 0, 0);
+}
+
+void DestroyWhiteboardOverlay()
+{
+    if (gWhiteboardWindow)
+    {
+        HWND window = gWhiteboardWindow;
+        gWhiteboardWindow = nullptr;
+        DestroyWindow(window);
+    }
+}
+
+void UpdateWhiteboardOverlay()
+{
+    if (!gWhiteboardActive.load(std::memory_order_relaxed))
+    {
+        if (gWhiteboardWindow)
+        {
+            ShowWindow(gWhiteboardWindow, SW_HIDE);
+        }
+        return;
+    }
+
+    RECT mapping{};
+    if (!GetCurrentMappingRect(mapping))
+    {
+        if (gWhiteboardWindow)
+        {
+            ShowWindow(gWhiteboardWindow, SW_HIDE);
+        }
+        return;
+    }
+
+    if (!gWhiteboardWindow)
+    {
+        gWhiteboardWindow = CreateWindowExW(
+            WS_EX_LAYERED |
+                WS_EX_TRANSPARENT |
+                WS_EX_TOOLWINDOW |
+                WS_EX_NOACTIVATE |
+                WS_EX_TOPMOST,
+            kWhiteboardClassName,
+            L"",
+            WS_POPUP,
+            mapping.left,
+            mapping.top,
+            mapping.right - mapping.left,
+            mapping.bottom - mapping.top,
+            nullptr,
+            nullptr,
+            gInstance,
+            nullptr);
+
+        if (!gWhiteboardWindow)
+        {
+            PostStatus(L"Could not create whiteboard overlay.");
+            return;
+        }
+
+        SetLayeredWindowAttributes(
+            gWhiteboardWindow,
+            RGB(1, 2, 3),
+            255,
+            LWA_COLORKEY);
+    }
+
+    SetWindowPos(
+        gWhiteboardWindow,
+        HWND_TOPMOST,
+        mapping.left,
+        mapping.top,
+        std::max(1L, mapping.right - mapping.left),
+        std::max(1L, mapping.bottom - mapping.top),
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(gWhiteboardWindow, nullptr, FALSE);
+}
+
+void SetWhiteboardActive(bool active)
+{
+    gWhiteboardActive.store(active, std::memory_order_release);
+    gWhiteboardStrokeActive = false;
+
+    if (gWhiteboardToggle)
+    {
+        SendMessageW(
+            gWhiteboardToggle,
+            BM_SETCHECK,
+            active ? BST_CHECKED : BST_UNCHECKED,
+            0);
+    }
+
+    if (active)
+    {
+        UpdateWhiteboardOverlay();
+        PostStatus(
+            L"Whiteboard enabled. Pencil/finger-draw now inks the transparent overlay.");
+    }
+    else
+    {
+        if (gWhiteboardWindow)
+        {
+            ShowWindow(gWhiteboardWindow, SW_HIDE);
+        }
+        PostStatus(L"Whiteboard disabled.");
+    }
+}
+
+void ClearWhiteboardInk()
+{
+    {
+        std::lock_guard lock(gWhiteboardMutex);
+        gWhiteboardSegments.clear();
+        gWhiteboardStrokeActive = false;
+    }
+
+    if (gWhiteboardWindow)
+    {
+        InvalidateRect(gWhiteboardWindow, nullptr, FALSE);
+    }
+    PostStatus(L"Whiteboard ink cleared.");
+}
+
+HBITMAP CaptureMappingBitmap(const RECT& mapping)
+{
+    const int width = mapping.right - mapping.left;
+    const int height = mapping.bottom - mapping.top;
+    if (width <= 0 || height <= 0)
+    {
+        return nullptr;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    if (!screenDc)
+    {
+        return nullptr;
+    }
+
+    HDC memoryDc = CreateCompatibleDC(screenDc);
+    HBITMAP bitmap =
+        CreateCompatibleBitmap(screenDc, width, height);
+
+    if (!memoryDc || !bitmap)
+    {
+        if (bitmap) DeleteObject(bitmap);
+        if (memoryDc) DeleteDC(memoryDc);
+        ReleaseDC(nullptr, screenDc);
+        return nullptr;
+    }
+
+    HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
+    const BOOL copied = BitBlt(
+        memoryDc,
+        0,
+        0,
+        width,
+        height,
+        screenDc,
+        mapping.left,
+        mapping.top,
+        SRCCOPY);
+
+    if (copied)
+    {
+        std::lock_guard lock(gWhiteboardMutex);
+        for (const WhiteboardSegment& segment : gWhiteboardSegments)
+        {
+            HPEN pen = CreatePen(
+                PS_SOLID,
+                segment.width,
+                RGB(255, 70, 60));
+            HGDIOBJ oldPen = SelectObject(memoryDc, pen);
+
+            MoveToEx(
+                memoryDc,
+                static_cast<int>(std::lround(
+                    segment.x1 * static_cast<double>(width - 1))),
+                static_cast<int>(std::lround(
+                    segment.y1 * static_cast<double>(height - 1))),
+                nullptr);
+            LineTo(
+                memoryDc,
+                static_cast<int>(std::lround(
+                    segment.x2 * static_cast<double>(width - 1))),
+                static_cast<int>(std::lround(
+                    segment.y2 * static_cast<double>(height - 1))));
+
+            SelectObject(memoryDc, oldPen);
+            DeleteObject(pen);
+        }
+    }
+
+    SelectObject(memoryDc, oldBitmap);
+    DeleteDC(memoryDc);
+    ReleaseDC(nullptr, screenDc);
+
+    if (!copied)
+    {
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+
+    return bitmap;
+}
+
+void ClipWhiteboardToClipboard()
+{
+    RECT mapping{};
+    if (!GetCurrentMappingRect(mapping))
+    {
+        PostStatus(L"Whiteboard clip failed: no valid mapping area.");
+        return;
+    }
+
+    const bool wasVisible =
+        gWhiteboardWindow &&
+        IsWindowVisible(gWhiteboardWindow);
+    if (wasVisible)
+    {
+        ShowWindow(gWhiteboardWindow, SW_HIDE);
+        DwmFlush();
+    }
+
+    HBITMAP bitmap = CaptureMappingBitmap(mapping);
+
+    if (wasVisible)
+    {
+        UpdateWhiteboardOverlay();
+    }
+
+    if (!bitmap)
+    {
+        PostStatus(L"Whiteboard clip failed: could not capture the screen.");
+        return;
+    }
+
+    std::vector<uint8_t> png;
+    const bool encoded = EncodeBitmapToPng(bitmap, png);
+    DeleteObject(bitmap);
+
+    if (!encoded ||
+        !PutPngOnClipboard(png.data(), png.size()))
+    {
+        PostStatus(L"Whiteboard clip failed: could not write the clipboard.");
+        return;
+    }
+
+    PostStatus(
+        L"Whiteboard clip copied to clipboard (" +
+        std::to_wstring(png.size() / 1024) +
+        L" KB).");
+}
+
 void DestroyZoneSelector()
 {
     if (gZoneSelectWindow)
@@ -2478,6 +2968,7 @@ void CompleteZoneSelection(HWND hwnd)
         gSelectingScreenRect = false;
 
         DestroyZoneSelector();
+        ClearWhiteboardInk();
         SetZoneStatusText();
         UpdateZoneOutline();
         PostStatus(
@@ -2496,6 +2987,7 @@ void CompleteZoneSelection(HWND hwnd)
     gPenTargetGeometry.valid = false;
 
     DestroyZoneSelector();
+    ClearWhiteboardInk();
     SetZoneStatusText();
     UpdateZoneOutline();
     ActivateTargetWindow(target);
@@ -2803,10 +3295,40 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             355, 87, 315, 20,
             hwnd, nullptr, nullptr, nullptr);
 
+        gWhiteboardToggle = CreateWindowExW(
+            0, L"BUTTON", L"Whiteboard",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+            20, 120, 105, 28,
+            hwnd,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(ID_WHITEBOARD_TOGGLE)),
+            nullptr,
+            nullptr);
+
+        HWND whiteboardClip = CreateWindowExW(
+            0, L"BUTTON", L"Clip Ink",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            135, 120, 90, 28,
+            hwnd,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(ID_WHITEBOARD_CLIP)),
+            nullptr,
+            nullptr);
+
+        HWND whiteboardClear = CreateWindowExW(
+            0, L"BUTTON", L"Clear Ink",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            235, 120, 90, 28,
+            hwnd,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(ID_WHITEBOARD_CLEAR)),
+            nullptr,
+            nullptr);
+
         HWND sendClipboard = CreateWindowExW(
             0, L"BUTTON", L"Send Clipboard",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            20, 120, 125, 28,
+            335, 120, 125, 28,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEND_CLIPBOARD_BUTTON)),
             nullptr,
@@ -2815,7 +3337,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         gAutoClipboardCheck = CreateWindowExW(
             0, L"BUTTON", L"Auto-send clipboard images",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            160, 122, 220, 24,
+            475, 122, 195, 24,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_AUTO_CLIPBOARD_CHECK)),
             nullptr,
@@ -2847,6 +3369,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         ApplyDefaultFont(selectScreenRect);
         ApplyDefaultFont(clearZone);
         ApplyDefaultFont(gZoneText);
+        ApplyDefaultFont(gWhiteboardToggle);
+        ApplyDefaultFont(whiteboardClip);
+        ApplyDefaultFont(whiteboardClear);
         ApplyDefaultFont(sendClipboard);
         ApplyDefaultFont(gAutoClipboardCheck);
         ApplyDefaultFont(urlLabel);
@@ -2859,6 +3384,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         ApplyDarkControlTheme(selectZone);
         ApplyDarkControlTheme(selectScreenRect);
         ApplyDarkControlTheme(clearZone);
+        ApplyDarkControlTheme(gWhiteboardToggle);
+        ApplyDarkControlTheme(whiteboardClip);
+        ApplyDarkControlTheme(whiteboardClear);
         ApplyDarkControlTheme(sendClipboard);
         ApplyDarkControlTheme(gAutoClipboardCheck);
 
@@ -2894,6 +3422,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         {
             ClearZone();
             PostStatus(L"Mapping cleared. Input uses the full selected window.");
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_WHITEBOARD_TOGGLE &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            const LRESULT checked =
+                SendMessageW(
+                    gWhiteboardToggle,
+                    BM_GETCHECK,
+                    0,
+                    0);
+            SetWhiteboardActive(checked == BST_CHECKED);
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_WHITEBOARD_CLIP &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            ClipWhiteboardToClipboard();
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_WHITEBOARD_CLEAR &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            ClearWhiteboardInk();
             return 0;
         }
         if (LOWORD(wParam) == ID_SEND_CLIPBOARD_BUTTON && HIWORD(wParam) == BN_CLICKED)
@@ -2950,6 +3502,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (wParam == ID_ZONE_TRACK_TIMER)
         {
             UpdateZoneOutline();
+            UpdateWhiteboardOverlay();
             return 0;
         }
         break;
@@ -2986,6 +3539,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, ID_ZONE_TRACK_TIMER);
         DestroyZoneSelector();
         DestroyZoneOutline();
+        DestroyWhiteboardOverlay();
         StopServer();
         PostQuitMessage(0);
         return 0;
@@ -3037,9 +3591,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     zoneOutlineClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
     zoneOutlineClass.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
 
-    if (!RegisterClassW(&zoneSelectClass) || !RegisterClassW(&zoneOutlineClass))
+    WNDCLASSW whiteboardClass{};
+    whiteboardClass.lpfnWndProc = WhiteboardProc;
+    whiteboardClass.hInstance = instance;
+    whiteboardClass.lpszClassName = kWhiteboardClassName;
+    whiteboardClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    whiteboardClass.hbrBackground =
+        reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+
+    if (!RegisterClassW(&zoneSelectClass) ||
+        !RegisterClassW(&zoneOutlineClass) ||
+        !RegisterClassW(&whiteboardClass))
     {
-        MessageBoxW(nullptr, L"Could not register PencilBridge zone overlay classes.", L"PencilBridge", MB_ICONERROR);
+        MessageBoxW(
+            nullptr,
+            L"Could not register PencilBridge overlay classes.",
+            L"PencilBridge",
+            MB_ICONERROR);
         return 1;
     }
 

@@ -53,6 +53,15 @@ label.toggle {
     white-space: nowrap;
 }
 input[type=checkbox] { width: 20px; height: 20px; }
+.header-button {
+    border: 1px solid #3a414d;
+    border-radius: 7px;
+    background: #20252d;
+    color: #e4e7ec;
+    padding: 6px 9px;
+    font: inherit;
+    white-space: nowrap;
+}
 .pressure-controls {
     flex: 0 0 auto;
     display: grid;
@@ -314,6 +323,9 @@ body.markup-active .metrics {
     <label class="toggle"><input id="pinchZoom" type="checkbox"> Pinch zoom</label>
     <label class="toggle"><input id="rotateGesture" type="checkbox"> Rotate</label>
     <label class="toggle"><input id="keepAwake" type="checkbox"> Keep awake</label>
+    <label class="toggle"><input id="whiteboardMode" type="checkbox"> Whiteboard</label>
+    <button id="whiteboardClip" class="header-button" type="button">Clip</button>
+    <button id="whiteboardClear" class="header-button" type="button">Clear ink</button>
 </header>
 
 <div class="pressure-controls">
@@ -372,6 +384,9 @@ body.markup-active .metrics {
     var pinchZoom = document.getElementById('pinchZoom');
     var rotateGesture = document.getElementById('rotateGesture');
     var keepAwake = document.getElementById('keepAwake');
+    var whiteboardMode = document.getElementById('whiteboardMode');
+    var whiteboardClip = document.getElementById('whiteboardClip');
+    var whiteboardClear = document.getElementById('whiteboardClear');
     var deviceText = document.getElementById('device');
     var pressureMetric = document.getElementById('pressureMetric');
     var pressureMax = document.getElementById('pressureMax');
@@ -574,6 +589,27 @@ body.markup-active .metrics {
         } else {
             releaseWakeLock();
         }
+    });
+
+    whiteboardMode.addEventListener('change', function () {
+        sendCommand(
+            whiteboardMode.checked
+                ? 'whiteboard,on'
+                : 'whiteboard,off');
+        showGestureToast(
+            whiteboardMode.checked
+                ? 'WHITEBOARD ON'
+                : 'WHITEBOARD OFF');
+    });
+
+    whiteboardClip.addEventListener('click', function () {
+        sendCommand('whiteboard,clip');
+        showGestureToast('CLIPPED TO PC');
+    });
+
+    whiteboardClear.addEventListener('click', function () {
+        sendCommand('whiteboard,clear');
+        showGestureToast('INK CLEARED');
     });
 
     document.addEventListener('visibilitychange', function () {
@@ -1333,7 +1369,9 @@ body.markup-active .metrics {
             return;
         }
         socket.send('cmd,' + command);
-        showGestureToast(command === 'undo' ? 'UNDO' : 'REDO');
+        if (command === 'undo' || command === 'redo') {
+            showGestureToast(command === 'undo' ? 'UNDO' : 'REDO');
+        }
     }
 
     function clearPendingFingerTimer() {
