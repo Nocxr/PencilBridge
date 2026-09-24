@@ -661,6 +661,23 @@ bool SendWebSocketFrame(SOCKET socket, uint8_t opcode, const std::string& payloa
         payload.size());
 }
 
+void SendWhiteboardStateToBrowser()
+{
+    const SOCKET socket = gWebSocketClient.load();
+    if (socket == INVALID_SOCKET)
+    {
+        return;
+    }
+
+    const std::string state =
+        gWhiteboardActive.load(std::memory_order_relaxed)
+            ? "state,whiteboard,1"
+            : "state,whiteboard,0";
+
+    std::lock_guard lock(gWebSocketSendMutex);
+    SendWebSocketFrame(socket, 0x1, state);
+}
+
 
 void ReleaseCom(IUnknown*& value)
 {
@@ -2072,6 +2089,8 @@ void WebSocketLoop(SOCKET socket)
         PostStatus(L"iPad/browser connected. Input is live.");
     }
 
+    SendWhiteboardStateToBrowser();
+
     while (gRunning.load() && gWebSocketClient.load() == socket)
     {
         uint8_t header[2]{};
@@ -2544,6 +2563,8 @@ void SetWhiteboardActive(bool active)
             active ? BST_CHECKED : BST_UNCHECKED,
             0);
     }
+
+    SendWhiteboardStateToBrowser();
 
     if (active)
     {

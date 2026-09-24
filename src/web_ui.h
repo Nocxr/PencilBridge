@@ -696,6 +696,12 @@ body.markup-active .metrics {
 
         socket.addEventListener('message', function (event) {
             if (typeof event.data === 'string') {
+                var parts = event.data.split(',');
+                if (parts.length === 3 &&
+                    parts[0] === 'state' &&
+                    parts[1] === 'whiteboard') {
+                    whiteboardMode.checked = parts[2] === '1';
+                }
                 return;
             }
             openMarkupImage(event.data);
