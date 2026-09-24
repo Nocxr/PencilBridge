@@ -216,7 +216,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var padRect = null;
     var latestTelemetry = null;
     var lastInputTime = 0;
-    var recentMaxGapMs = 0;
+    var strokeMaxGapMs = 0;
 
     function loadNumber(key, fallback) {
         var value = Number(localStorage.getItem(key));
@@ -330,7 +330,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
         positionText.textContent =
             sample.x.toFixed(3) + ', ' + sample.y.toFixed(3) +
             '  r' + penRestarts + '/c' + penCancels +
-            '  gap≤' + recentMaxGapMs.toFixed(0) + 'ms';
+            '  gap≤' + strokeMaxGapMs.toFixed(0) + 'ms';
 
         cursor.style.display = 'block';
         cursor.style.left = (sample.clientX - padRect.left) + 'px';
@@ -390,13 +390,22 @@ input[type=checkbox] { width: 20px; height: 20px; }
         }
 
         var now = performance.now();
-        if (lastInputTime > 0) {
-            var gap = now - lastInputTime;
-            if (gap > recentMaxGapMs) {
-                recentMaxGapMs = gap;
+        if (event.pointerType === 'pen') {
+            if (phase === 'd') {
+                lastInputTime = now;
+                strokeMaxGapMs = 0;
+            } else if (penActive && lastInputTime > 0) {
+                var gap = now - lastInputTime;
+                if (gap > strokeMaxGapMs) {
+                    strokeMaxGapMs = gap;
+                }
+                lastInputTime = now;
+            }
+
+            if (phase === 'u' || phase === 'c') {
+                lastInputTime = 0;
             }
         }
-        lastInputTime = now;
 
         var point = normalized(event);
         queueTelemetry(event, point);
@@ -480,8 +489,6 @@ input[type=checkbox] { width: 20px; height: 20px; }
             updateReadout(latestTelemetry);
             latestTelemetry = null;
         }
-        // Decay the displayed worst gap so old stalls don't stick forever.
-        recentMaxGapMs *= 0.985;
         requestAnimationFrame(telemetryFrame);
     }
 
