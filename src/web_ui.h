@@ -1182,10 +1182,11 @@ body.markup-active .metrics {
         event.preventDefault();
 
         // A fresh physical Pencil DOWN always starts a fresh bridge stroke.
-        // Do not depend on Safari pointer-capture state from the prior stroke.
+        // If Safari lost the prior UP/CANCEL, explicitly release the host-side
+        // synthetic pen before starting this stroke.
         if (penActive) {
             penCancels += 1;
-            penActive = false;
+            sendEvent(event, 'c');
         }
         sendEvent(event, 'd');
     }, { passive: false });

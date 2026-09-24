@@ -1305,6 +1305,28 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
 
     if (event.phase == 'd')
     {
+        // Treat every fresh browser DOWN as authoritative. If an UP/CANCEL was
+        // lost anywhere in Safari/network delivery, release the old synthetic
+        // stroke before beginning the new one. Injecting DOWN while already down
+        // can cause Windows Ink to drop the entire next stroke.
+        if (gPenDown)
+        {
+            InjectPenPacket(
+                gLastPenScreenPoint,
+                POINTER_FLAG_UP | POINTER_FLAG_INRANGE,
+                0,
+                gLastPenTiltX,
+                gLastPenTiltY);
+            InjectPenPacket(
+                gLastPenScreenPoint,
+                POINTER_FLAG_UP,
+                0,
+                gLastPenTiltX,
+                gLastPenTiltY);
+            gPenDown = false;
+            gPenInRange = false;
+        }
+
         ActivateTargetWindow(target);
         if (!PointBelongsToTarget(point, target))
         {
