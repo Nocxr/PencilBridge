@@ -1700,25 +1700,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
             20, 44, 540, 300,
-            hwnd, reinterpret_cast<HMENU>(ID_TARGET_COMBO), nullptr, nullptr);
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TARGET_COMBO)), nullptr, nullptr);
 
         HWND refresh = CreateWindowExW(
             0, L"BUTTON", L"Refresh",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             570, 44, 100, 28,
-            hwnd, reinterpret_cast<HMENU>(ID_REFRESH_BUTTON), nullptr, nullptr);
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_REFRESH_BUTTON)), nullptr, nullptr);
 
         HWND selectZone = CreateWindowExW(
             0, L"BUTTON", L"Select Zone",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             20, 82, 110, 28,
-            hwnd, reinterpret_cast<HMENU>(ID_SELECT_ZONE_BUTTON), nullptr, nullptr);
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SELECT_ZONE_BUTTON)), nullptr, nullptr);
 
         HWND clearZone = CreateWindowExW(
             0, L"BUTTON", L"Clear Zone",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             140, 82, 100, 28,
-            hwnd, reinterpret_cast<HMENU>(ID_CLEAR_ZONE_BUTTON), nullptr, nullptr);
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CLEAR_ZONE_BUTTON)), nullptr, nullptr);
 
         gZoneText = CreateWindowExW(
             0, L"STATIC", L"Zone: full window",

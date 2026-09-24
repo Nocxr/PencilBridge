@@ -2,6 +2,12 @@ param(
     [switch]$Clean
 )
 
+try {
+    $Commit = (git rev-parse --short HEAD 2>$null).Trim()
+    if ($Commit) { Write-Host "PencilBridge commit: $Commit" }
+} catch {}
+
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
