@@ -1766,6 +1766,38 @@ void ClearGestureTouches()
     }
 }
 
+void ReleaseGestureTouches()
+{
+    if (!gTouchInjectionReady)
+    {
+        ClearGestureTouches();
+        return;
+    }
+
+    std::array<POINTER_TOUCH_INFO, 4> infos{};
+    UINT32 count = 0;
+
+    for (const GestureTouchState& touch : gGestureTouches)
+    {
+        if (!touch.active)
+        {
+            continue;
+        }
+
+        FillTouchInfo(
+            infos[count++],
+            touch,
+            POINTER_FLAG_UP);
+    }
+
+    if (count > 0)
+    {
+        InjectTouchInput(count, infos.data());
+    }
+
+    ClearGestureTouches();
+}
+
 void FillTouchInfo(
     POINTER_TOUCH_INFO& info,
     const GestureTouchState& touch,
@@ -1879,20 +1911,28 @@ void DrawWhiteboardInput(const InputEvent& event)
 
     std::lock_guard lock(gWhiteboardMutex);
 
+    const int width =
+        std::clamp(
+            2 + static_cast<int>(std::lround(event.pressure * 10.0)),
+            2,
+            12);
+
     if (event.phase == 'd')
     {
         gWhiteboardStrokeActive = true;
         gWhiteboardLastX = event.x;
         gWhiteboardLastY = event.y;
+
+        // Keep very short Pencil taps/strokes visible.
+        gWhiteboardSegments.push_back({
+            event.x,
+            event.y,
+            event.x,
+            event.y,
+            width});
     }
     else if (event.phase == 'm' && gWhiteboardStrokeActive)
     {
-        const int width =
-            std::clamp(
-                2 + static_cast<int>(std::lround(event.pressure * 10.0)),
-                2,
-                12);
-
         gWhiteboardSegments.push_back({
             gWhiteboardLastX,
             gWhiteboardLastY,
@@ -1903,8 +1943,21 @@ void DrawWhiteboardInput(const InputEvent& event)
         gWhiteboardLastX = event.x;
         gWhiteboardLastY = event.y;
     }
-    else if (event.phase == 'u' || event.phase == 'c')
+    else if ((event.phase == 'u' || event.phase == 'c') &&
+             gWhiteboardStrokeActive)
     {
+        if (event.phase == 'u' &&
+            (event.x != gWhiteboardLastX ||
+             event.y != gWhiteboardLastY))
+        {
+            gWhiteboardSegments.push_back({
+                gWhiteboardLastX,
+                gWhiteboardLastY,
+                event.x,
+                event.y,
+                width});
+        }
+
         gWhiteboardStrokeActive = false;
     }
 
@@ -1980,7 +2033,7 @@ void ReleaseActiveInputState()
         gActiveTouchPointer = -1;
     }
 
-    ClearGestureTouches();
+    ReleaseGestureTouches();
 
     if (gPenDown && gPenDevice)
     {
@@ -2359,19 +2412,37 @@ LRESULT CALLBACK WhiteboardProc(
                 RGB(255, 70, 60));
             HGDIOBJ oldPen = SelectObject(dc, pen);
 
-            MoveToEx(
-                dc,
+            const int x1 =
                 static_cast<int>(std::lround(
-                    segment.x1 * static_cast<double>(width - 1))),
+                    segment.x1 * static_cast<double>(width - 1)));
+            const int y1 =
                 static_cast<int>(std::lround(
-                    segment.y1 * static_cast<double>(height - 1))),
-                nullptr);
-            LineTo(
-                dc,
+                    segment.y1 * static_cast<double>(height - 1)));
+            const int x2 =
                 static_cast<int>(std::lround(
-                    segment.x2 * static_cast<double>(width - 1))),
+                    segment.x2 * static_cast<double>(width - 1)));
+            const int y2 =
                 static_cast<int>(std::lround(
-                    segment.y2 * static_cast<double>(height - 1))));
+                    segment.y2 * static_cast<double>(height - 1)));
+
+            if (x1 == x2 && y1 == y2)
+            {
+                HGDIOBJ oldBrush =
+                    SelectObject(dc, CreateSolidBrush(RGB(255, 70, 60)));
+                Ellipse(
+                    dc,
+                    x1 - segment.width / 2,
+                    y1 - segment.width / 2,
+                    x1 + segment.width / 2 + 1,
+                    y1 + segment.width / 2 + 1);
+                HGDIOBJ brush = SelectObject(dc, oldBrush);
+                DeleteObject(brush);
+            }
+            else
+            {
+                MoveToEx(dc, x1, y1, nullptr);
+                LineTo(dc, x2, y2);
+            }
 
             SelectObject(dc, oldPen);
             DeleteObject(pen);
@@ -2555,19 +2626,39 @@ HBITMAP CaptureMappingBitmap(const RECT& mapping)
                 RGB(255, 70, 60));
             HGDIOBJ oldPen = SelectObject(memoryDc, pen);
 
-            MoveToEx(
-                memoryDc,
+            const int x1 =
                 static_cast<int>(std::lround(
-                    segment.x1 * static_cast<double>(width - 1))),
+                    segment.x1 * static_cast<double>(width - 1)));
+            const int y1 =
                 static_cast<int>(std::lround(
-                    segment.y1 * static_cast<double>(height - 1))),
-                nullptr);
-            LineTo(
-                memoryDc,
+                    segment.y1 * static_cast<double>(height - 1)));
+            const int x2 =
                 static_cast<int>(std::lround(
-                    segment.x2 * static_cast<double>(width - 1))),
+                    segment.x2 * static_cast<double>(width - 1)));
+            const int y2 =
                 static_cast<int>(std::lround(
-                    segment.y2 * static_cast<double>(height - 1))));
+                    segment.y2 * static_cast<double>(height - 1)));
+
+            if (x1 == x2 && y1 == y2)
+            {
+                HGDIOBJ oldBrush =
+                    SelectObject(
+                        memoryDc,
+                        CreateSolidBrush(RGB(255, 70, 60)));
+                Ellipse(
+                    memoryDc,
+                    x1 - segment.width / 2,
+                    y1 - segment.width / 2,
+                    x1 + segment.width / 2 + 1,
+                    y1 + segment.width / 2 + 1);
+                HGDIOBJ brush = SelectObject(memoryDc, oldBrush);
+                DeleteObject(brush);
+            }
+            else
+            {
+                MoveToEx(memoryDc, x1, y1, nullptr);
+                LineTo(memoryDc, x2, y2);
+            }
 
             SelectObject(memoryDc, oldPen);
             DeleteObject(pen);
