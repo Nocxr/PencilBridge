@@ -178,7 +178,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
     <div class="metric"><b>Device</b><span id="device">—</span></div>
     <div class="metric"><b>Pressure raw → out</b><span id="pressureMetric">0.000 → 0.000</span></div>
     <div class="metric"><b>Tilt</b><span id="tilt">0°, 0°</span></div>
-    <div class="metric"><b>Position</b><span id="position">0.000, 0.000</span></div>
+    <div class="metric"><b>Position / stroke</b><span id="position">0.000, 0.000</span></div>
 </div>
 
 <main id="pad" aria-label="Pencil input surface">
@@ -210,6 +210,8 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var reconnectTimer = null;
     var activeTouchId = null;
     var penActive = false;
+    var penRestarts = 0;
+    var penCancels = 0;
     var peakPressure = 0;
 
     function loadNumber(key, fallback) {
@@ -301,7 +303,9 @@ input[type=checkbox] { width: 20px; height: 20px; }
         deviceText.textContent = type === 'pen' ? 'Apple Pencil / pen' : type;
         pressureMetric.textContent = rawPressure.toFixed(3) + ' → ' + outputPressure.toFixed(3);
         tiltText.textContent = Math.round(event.tiltX || 0) + '°, ' + Math.round(event.tiltY || 0) + '°';
-        positionText.textContent = point.x.toFixed(3) + ', ' + point.y.toFixed(3);
+        positionText.textContent =
+            point.x.toFixed(3) + ', ' + point.y.toFixed(3) +
+            '  r' + penRestarts + '/c' + penCancels;
 
         cursor.style.display = 'block';
         cursor.style.left = (event.clientX - point.rect.left) + 'px';
@@ -334,7 +338,16 @@ input[type=checkbox] { width: 20px; height: 20px; }
             if (phase === 'd') {
                 penActive = true;
             } else if (phase === 'm' && !penActive) {
-                return;
+                // Safari can occasionally cancel/recreate a Pencil pointer during a
+                // continuous physical contact. If pressure says the tip is still down,
+                // transparently begin a fresh synthetic stroke instead of going silent.
+                if (Number(event.pressure || 0) > 0.001) {
+                    penActive = true;
+                    penRestarts += 1;
+                    phase = 'd';
+                } else {
+                    return;
+                }
             } else if ((phase === 'u' || phase === 'c') && !penActive) {
                 return;
             }
@@ -424,10 +437,19 @@ input[type=checkbox] { width: 20px; height: 20px; }
         if (!shouldForward(event)) {
             return;
         }
+        if (event.pointerType === 'pen') {
+            penCancels += 1;
+        }
         sendEvent(event, 'c');
         penActive = false;
         activeTouchId = null;
     }, { passive: false });
+
+    pad.addEventListener('lostpointercapture', function (event) {
+        if (event.pointerType === 'pen' && penActive && Number(event.pressure || 0) > 0.001) {
+            penCancels += 1;
+        }
+    });
 
     pad.addEventListener('contextmenu', function (event) {
         event.preventDefault();

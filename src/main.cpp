@@ -708,12 +708,19 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
 
     if (event.phase == 'm')
     {
-        if (!gPenDown || !PointBelongsToTarget(point, target))
+        if (!gPenDown)
         {
             return;
         }
 
-        const UINT32 pressure = static_cast<UINT32>(std::lround(event.pressure * 1024.0));
+        // Once a validated DOWN starts, keep ownership of the stroke until UP/CANCEL.
+        // Re-hit-testing every move can break continuous strokes on transient overlays.
+        UINT32 pressure = static_cast<UINT32>(std::lround(event.pressure * 1024.0));
+        if (pressure == 0)
+        {
+            pressure = 1;
+        }
+
         InjectPenPacket(
             point,
             POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
