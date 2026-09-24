@@ -4,6 +4,8 @@ $ErrorActionPreference = "Stop"
 Get-Process PencilBridge -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 150
 
+& (Join-Path $PSScriptRoot "Ensure-Https.ps1")
+
 $paths = @(
     (Join-Path $PSScriptRoot "build\PencilBridge.exe"),
     (Join-Path $PSScriptRoot "build\Release\PencilBridge.exe")

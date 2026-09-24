@@ -837,7 +837,10 @@ body.whiteboard-active #pressure::before {
         setConnection(false, 'Connecting…');
 
         try {
-            socket = new WebSocket('ws://' + location.host + '/ws');
+            var websocketScheme =
+                location.protocol === 'https:' ? 'wss://' : 'ws://';
+            socket = new WebSocket(
+                websocketScheme + location.host + '/ws');
             socket.binaryType = 'arraybuffer';
         } catch (error) {
             setConnection(false, 'Connection failed');

@@ -23,6 +23,7 @@ target_link_libraries(PencilBridge PRIVATE
     crypt32
     dwmapi
     ole32
+    secur32
     user32
     uxtheme
     windowscodecs
