@@ -55,6 +55,10 @@ std::thread gServerThread;
 HSYNTHETICPOINTERDEVICE gPenDevice = nullptr;
 std::mutex gInputMutex;
 bool gPenDown = false;
+bool gPenInRange = false;
+POINT gLastPenScreenPoint{};
+int gLastPenTiltX = 0;
+int gLastPenTiltY = 0;
 bool gTouchDown = false;
 int gActiveTouchPointer = -1;
 
@@ -587,6 +591,64 @@ bool ParseInputEvent(const std::string& message, InputEvent& event)
     return true;
 }
 
+POINT ToSyntheticPenPoint(POINT screenPoint)
+{
+    const int virtualX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtualY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    POINT result{
+        screenPoint.x - virtualX,
+        screenPoint.y - virtualY
+    };
+
+    if (virtualWidth > 0)
+    {
+        result.x = std::clamp<LONG>(result.x, 0, virtualWidth - 1);
+    }
+    if (virtualHeight > 0)
+    {
+        result.y = std::clamp<LONG>(result.y, 0, virtualHeight - 1);
+    }
+
+    return result;
+}
+
+bool InjectPenPacket(
+    POINT screenPoint,
+    POINTER_FLAGS pointerFlags,
+    UINT32 pressure,
+    int tiltX,
+    int tiltY)
+{
+    POINTER_TYPE_INFO info{};
+    info.type = PT_PEN;
+
+    POINTER_PEN_INFO& pen = info.penInfo;
+    pen.pointerInfo.pointerType = PT_PEN;
+    pen.pointerInfo.pointerId = 1;
+    pen.pointerInfo.pointerFlags = pointerFlags;
+    pen.pointerInfo.ptPixelLocation = ToSyntheticPenPoint(screenPoint);
+    pen.penMask = static_cast<PEN_MASK>(PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y);
+    pen.penFlags = PEN_FLAG_NONE;
+    pen.pressure = std::min<UINT32>(pressure, 1024);
+    pen.tiltX = std::clamp(tiltX, -90, 90);
+    pen.tiltY = std::clamp(tiltY, -90, 90);
+
+    if (!InjectSyntheticPointerInput(gPenDevice, &info, 1))
+    {
+        const DWORD error = GetLastError();
+        PostStatus(L"Synthetic pen injection failed. GetLastError=" + std::to_wstring(error));
+        return false;
+    }
+
+    gLastPenScreenPoint = screenPoint;
+    gLastPenTiltX = pen.tiltX;
+    gLastPenTiltY = pen.tiltY;
+    return true;
+}
+
 void InjectPen(const InputEvent& event, POINT point, HWND target)
 {
     if (!gPenDevice)
@@ -609,72 +671,85 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
             PostStatus(L"Input blocked: selected target is not visible at the mapped pen position.");
             return;
         }
+
+        // Windows Ink behaves more reliably when a pen enters range before first contact.
+        if (!gPenInRange)
+        {
+            if (!InjectPenPacket(
+                    point,
+                    POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE,
+                    0,
+                    event.tiltX,
+                    event.tiltY))
+            {
+                return;
+            }
+            gPenInRange = true;
+        }
+
+        UINT32 pressure = static_cast<UINT32>(std::lround(event.pressure * 1024.0));
+        if (pressure == 0)
+        {
+            pressure = 1;
+        }
+
+        if (InjectPenPacket(
+                point,
+                POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
+                pressure,
+                event.tiltX,
+                event.tiltY))
+        {
+            gPenDown = true;
+            gPenInRange = true;
+        }
+        return;
     }
-    else if (event.phase == 'm')
+
+    if (event.phase == 'm')
     {
         if (!gPenDown || !PointBelongsToTarget(point, target))
         {
             return;
         }
+
+        const UINT32 pressure = static_cast<UINT32>(std::lround(event.pressure * 1024.0));
+        InjectPenPacket(
+            point,
+            POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
+            pressure,
+            event.tiltX,
+            event.tiltY);
+        return;
     }
 
-    POINTER_TYPE_INFO info{};
-    info.type = PT_PEN;
-
-    POINTER_PEN_INFO& pen = info.penInfo;
-    pen.pointerInfo.pointerType = PT_PEN;
-    pen.pointerInfo.pointerId = 1;
-    pen.pointerInfo.ptPixelLocation = point;
-    pen.pointerInfo.ptPixelLocationRaw = point;
-    pen.penMask = static_cast<PEN_MASK>(PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y);
-    pen.penFlags = PEN_FLAG_NONE;
-    pen.pressure = static_cast<UINT32>(std::lround(event.pressure * 1024.0));
-    pen.tiltX = event.tiltX;
-    pen.tiltY = event.tiltY;
-
-    if (event.phase == 'd')
-    {
-        if (pen.pressure == 0)
-        {
-            pen.pressure = 1;
-        }
-        pen.pointerInfo.pointerFlags =
-            POINTER_FLAG_DOWN |
-            POINTER_FLAG_INRANGE |
-            POINTER_FLAG_INCONTACT |
-            POINTER_FLAG_PRIMARY;
-    }
-    else if (event.phase == 'u' || event.phase == 'c')
+    if (event.phase == 'u' || event.phase == 'c')
     {
         if (!gPenDown)
         {
             return;
         }
-        pen.pressure = 0;
-        pen.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_PRIMARY;
-    }
-    else
-    {
-        pen.pointerInfo.pointerFlags =
-            POINTER_FLAG_UPDATE |
-            POINTER_FLAG_INRANGE |
-            POINTER_FLAG_PRIMARY;
-        if (gPenDown || event.pressure > 0.0)
-        {
-            pen.pointerInfo.pointerFlags |= POINTER_FLAG_INCONTACT;
-        }
-    }
 
-    if (InjectSyntheticPointerInput(gPenDevice, &info, 1))
-    {
-        if (event.phase == 'd')
+        // Lift while still in range, then leave range completely.
+        const bool lifted = InjectPenPacket(
+            point,
+            POINTER_FLAG_UP | POINTER_FLAG_INRANGE,
+            0,
+            event.tiltX,
+            event.tiltY);
+
+        if (lifted)
         {
-            gPenDown = true;
+            InjectPenPacket(
+                point,
+                POINTER_FLAG_UP,
+                0,
+                event.tiltX,
+                event.tiltY);
         }
-        else if (event.phase == 'u' || event.phase == 'c')
-        {
-            gPenDown = false;
-        }
+
+        gPenDown = false;
+        gPenInRange = false;
     }
 }
 
@@ -847,7 +922,23 @@ void WebSocketLoop(SOCKET socket)
             gTouchDown = false;
             gActiveTouchPointer = -1;
         }
+        if (gPenDown && gPenDevice)
+        {
+            InjectPenPacket(
+                gLastPenScreenPoint,
+                POINTER_FLAG_UP | POINTER_FLAG_INRANGE,
+                0,
+                gLastPenTiltX,
+                gLastPenTiltY);
+            InjectPenPacket(
+                gLastPenScreenPoint,
+                POINTER_FLAG_UP,
+                0,
+                gLastPenTiltX,
+                gLastPenTiltY);
+        }
         gPenDown = false;
+        gPenInRange = false;
     }
 
     PostStatus(L"Client disconnected. Waiting for iPad/browser...");
