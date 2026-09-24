@@ -138,7 +138,24 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM)
     return TRUE;
 }
 
-void SelectComboIndex(int index)
+bool ActivateTargetWindow(HWND target)
+{
+    if (!target || !IsWindow(target))
+    {
+        return false;
+    }
+
+    if (IsIconic(target))
+    {
+        ShowWindowAsync(target, SW_RESTORE);
+    }
+
+    BringWindowToTop(target);
+    SetForegroundWindow(target);
+    return IsWindowVisible(target) != FALSE;
+}
+
+void SelectComboIndex(int index, bool activate)
 {
     if (index < 0 || index >= static_cast<int>(gWindows.size()))
     {
@@ -146,8 +163,17 @@ void SelectComboIndex(int index)
         return;
     }
 
-    gTargetWindow.store(gWindows[static_cast<size_t>(index)].hwnd);
-    const std::wstring status = L"Target: " + gWindows[static_cast<size_t>(index)].label;
+    const HWND target = gWindows[static_cast<size_t>(index)].hwnd;
+    gTargetWindow.store(target);
+
+    if (activate)
+    {
+        ActivateTargetWindow(target);
+    }
+
+    const std::wstring status =
+        (activate ? L"Armed target: " : L"Target: ") +
+        gWindows[static_cast<size_t>(index)].label;
     SetWindowTextW(gStatusText, status.c_str());
 }
 
@@ -177,7 +203,7 @@ void RefreshWindows()
     if (desiredIndex >= 0)
     {
         SendMessageW(gTargetCombo, CB_SETCURSEL, desiredIndex, 0);
-        SelectComboIndex(desiredIndex);
+        SelectComboIndex(desiredIndex, false);
     }
     else
     {
@@ -432,6 +458,23 @@ bool SendWebSocketFrame(SOCKET socket, uint8_t opcode, const std::string& payloa
     return SendAll(socket, reinterpret_cast<const char*>(frame.data()), frame.size());
 }
 
+HWND TopLevelWindowAtPoint(POINT point)
+{
+    const HWND window = WindowFromPoint(point);
+    if (!window)
+    {
+        return nullptr;
+    }
+
+    const HWND root = GetAncestor(window, GA_ROOT);
+    return root ? root : window;
+}
+
+bool PointBelongsToTarget(POINT point, HWND target)
+{
+    return TopLevelWindowAtPoint(point) == target;
+}
+
 bool MapToTarget(double normalizedX, double normalizedY, POINT& outPoint, HWND& outTarget)
 {
     HWND target = gTargetWindow.load();
@@ -553,9 +596,26 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
 
     std::lock_guard lock(gInputMutex);
 
+    if (event.phase == 'h')
+    {
+        return;
+    }
+
     if (event.phase == 'd')
     {
-        SetForegroundWindow(target);
+        ActivateTargetWindow(target);
+        if (!PointBelongsToTarget(point, target))
+        {
+            PostStatus(L"Input blocked: selected target is not visible at the mapped pen position.");
+            return;
+        }
+    }
+    else if (event.phase == 'm')
+    {
+        if (!gPenDown || !PointBelongsToTarget(point, target))
+        {
+            return;
+        }
     }
 
     POINTER_TYPE_INFO info{};
@@ -592,14 +652,6 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
         }
         pen.pressure = 0;
         pen.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_PRIMARY;
-    }
-    else if (event.phase == 'h')
-    {
-        pen.pressure = 0;
-        pen.pointerInfo.pointerFlags =
-            POINTER_FLAG_UPDATE |
-            POINTER_FLAG_INRANGE |
-            POINTER_FLAG_PRIMARY;
     }
     else
     {
@@ -644,9 +696,15 @@ void InjectTouchMouse(const InputEvent& event, POINT point, HWND target)
         {
             return;
         }
+        ActivateTargetWindow(target);
+        if (!PointBelongsToTarget(point, target))
+        {
+            PostStatus(L"Input blocked: selected target is not visible at the mapped touch position.");
+            return;
+        }
+
         gTouchDown = true;
         gActiveTouchPointer = event.pointerId;
-        SetForegroundWindow(target);
         SetCursorPos(point.x, point.y);
         SendMouseButton(MOUSEEVENTF_LEFTDOWN);
     }
@@ -1035,7 +1093,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (LOWORD(wParam) == ID_TARGET_COMBO && HIWORD(wParam) == CBN_SELCHANGE)
         {
             const int index = static_cast<int>(SendMessageW(gTargetCombo, CB_GETCURSEL, 0, 0));
-            SelectComboIndex(index);
+            SelectComboIndex(index, true);
             return 0;
         }
         break;

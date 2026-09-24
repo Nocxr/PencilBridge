@@ -156,6 +156,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var socket = null;
     var reconnectTimer = null;
     var activeTouchId = null;
+    var penActive = false;
 
     function setConnection(isLive, text) {
         dot.classList.toggle('live', isLive);
@@ -226,6 +227,16 @@ input[type=checkbox] { width: 20px; height: 20px; }
             return;
         }
 
+        if (event.pointerType === 'pen') {
+            if (phase === 'd') {
+                penActive = true;
+            } else if (phase === 'm' && !penActive) {
+                return;
+            } else if ((phase === 'u' || phase === 'c') && !penActive) {
+                return;
+            }
+        }
+
         if (event.pointerType === 'touch') {
             if (phase === 'd') {
                 if (activeTouchId !== null) {
@@ -253,6 +264,10 @@ input[type=checkbox] { width: 20px; height: 20px; }
         ].join(',');
 
         socket.send(message);
+
+        if (event.pointerType === 'pen' && (phase === 'u' || phase === 'c')) {
+            penActive = false;
+        }
 
         if (event.pointerType === 'touch' && (phase === 'u' || phase === 'c')) {
             activeTouchId = null;
@@ -284,10 +299,10 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
         for (var i = 0; i < samples.length; ++i) {
             var sample = samples[i];
-            var phase = (sample.pointerType === 'pen' && !sample.buttons && Number(sample.pressure || 0) === 0)
-                ? 'h'
-                : 'm';
-            sendEvent(sample, phase);
+            if (sample.pointerType === 'pen' && !penActive) {
+                continue;
+            }
+            sendEvent(sample, 'm');
         }
     }, { passive: false });
 
@@ -305,14 +320,9 @@ input[type=checkbox] { width: 20px; height: 20px; }
             return;
         }
         sendEvent(event, 'c');
+        penActive = false;
         activeTouchId = null;
     }, { passive: false });
-
-    pad.addEventListener('pointerleave', function (event) {
-        if (event.pointerType === 'pen' && shouldForward(event)) {
-            sendEvent(event, 'h');
-        }
-    });
 
     pad.addEventListener('contextmenu', function (event) {
         event.preventDefault();
