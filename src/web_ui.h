@@ -183,7 +183,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
     touch-action: none;
 }
 #gestureToast {
-    position: absolute;
+    position: fixed;
     left: 50%;
     top: 50%;
     transform: translate(-50%, -50%) scale(.92);
@@ -251,6 +251,8 @@ input[type=checkbox] { width: 20px; height: 20px; }
     <div class="metric"><b>Position / stroke</b><span id="position">0.000, 0.000</span></div>
 </div>
 
+<div id="gestureToast"></div>
+
 <section id="markupView">
     <div class="markup-toolbar">
         <strong>Markup</strong>
@@ -268,7 +270,6 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
 <main id="pad" aria-label="Pencil input surface">
     <div id="cursor"></div>
-    <div id="gestureToast"></div>
     <div id="pressure">Touch with Apple Pencil to begin</div>
 </main>
 
