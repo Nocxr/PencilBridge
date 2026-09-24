@@ -7,6 +7,9 @@
 #include <bcrypt.h>
 #include <wincrypt.h>
 #include <wincodec.h>
+#define SECURITY_WIN32
+#include <security.h>
+#include <schannel.h>
 
 #include <algorithm>
 #include <array>
@@ -17,12 +20,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "web_ui.h"
@@ -31,6 +37,7 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "secur32.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -50,6 +57,7 @@ constexpr int ID_WHITEBOARD_CLIP = 1009;
 constexpr int ID_WHITEBOARD_CLEAR = 1010;
 constexpr UINT_PTR ID_ZONE_TRACK_TIMER = 2001;
 constexpr int kPort = 8765;
+constexpr int kBootstrapPort = 8764;
 constexpr wchar_t kZoneSelectClassName[] = L"PencilBridgeZoneSelect";
 constexpr wchar_t kZoneOutlineClassName[] = L"PencilBridgeZoneOutline";
 constexpr wchar_t kWhiteboardClassName[] = L"PencilBridgeWhiteboardOverlay";
@@ -120,11 +128,39 @@ std::vector<WindowEntry> gWindows;
 std::atomic<HWND> gTargetWindow{nullptr};
 std::atomic<bool> gRunning{true};
 std::atomic<SOCKET> gListenSocket{INVALID_SOCKET};
+std::atomic<SOCKET> gBootstrapListenSocket{INVALID_SOCKET};
 std::atomic<SOCKET> gWebSocketClient{INVALID_SOCKET};
 std::mutex gWebSocketSendMutex;
 std::mutex gOpenClientSocketsMutex;
 std::vector<SOCKET> gOpenClientSockets;
 std::thread gServerThread;
+std::thread gBootstrapThread;
+
+struct TlsConnection
+{
+    CtxtHandle context{};
+    bool contextValid = false;
+    SecPkgContext_StreamSizes streamSizes{};
+    std::vector<uint8_t> encryptedPending;
+    std::vector<uint8_t> plainPending;
+    std::mutex sendMutex;
+    std::mutex recvMutex;
+
+    ~TlsConnection()
+    {
+        if (contextValid)
+        {
+            DeleteSecurityContext(&context);
+        }
+    }
+};
+
+CredHandle gTlsCredentials{};
+bool gTlsCredentialsValid = false;
+HCERTSTORE gTlsCertificateStore = nullptr;
+PCCERT_CONTEXT gTlsServerCertificate = nullptr;
+std::mutex gTlsConnectionsMutex;
+std::unordered_map<SOCKET, std::shared_ptr<TlsConnection>> gTlsConnections;
 
 IWICImagingFactory* gWicFactory = nullptr;
 std::atomic<bool> gAutoSendClipboard{true};
@@ -449,12 +485,20 @@ std::string GetLocalIPv4()
     return best;
 }
 
-bool SendAll(SOCKET socket, const char* data, size_t size)
+bool RawSendAll(SOCKET socket, const char* data, size_t size)
 {
     size_t sent = 0;
     while (sent < size)
     {
-        const int chunk = send(socket, data + sent, static_cast<int>(size - sent), 0);
+        const int chunk =
+            send(
+                socket,
+                data + sent,
+                static_cast<int>(
+                    std::min<size_t>(
+                        size - sent,
+                        static_cast<size_t>(INT_MAX))),
+                0);
         if (chunk <= 0)
         {
             return false;
@@ -464,9 +508,585 @@ bool SendAll(SOCKET socket, const char* data, size_t size)
     return true;
 }
 
+int RawRecvSome(SOCKET socket, char* data, int size)
+{
+    return recv(socket, data, size, 0);
+}
+
+std::shared_ptr<TlsConnection> GetTlsConnection(SOCKET socket)
+{
+    std::lock_guard lock(gTlsConnectionsMutex);
+    const auto it = gTlsConnections.find(socket);
+    return it == gTlsConnections.end()
+        ? nullptr
+        : it->second;
+}
+
+void RegisterTlsConnection(
+    SOCKET socket,
+    const std::shared_ptr<TlsConnection>& connection)
+{
+    std::lock_guard lock(gTlsConnectionsMutex);
+    gTlsConnections[socket] = connection;
+}
+
+void UnregisterTlsConnection(SOCKET socket)
+{
+    std::lock_guard lock(gTlsConnectionsMutex);
+    gTlsConnections.erase(socket);
+}
+
+bool InitializeTlsCredentials()
+{
+    if (gTlsCredentialsValid)
+    {
+        return true;
+    }
+
+    gTlsCertificateStore = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W,
+        0,
+        0,
+        CERT_SYSTEM_STORE_CURRENT_USER,
+        L"MY");
+    if (!gTlsCertificateStore)
+    {
+        return false;
+    }
+
+    gTlsServerCertificate = CertFindCertificateInStore(
+        gTlsCertificateStore,
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        0,
+        CERT_FIND_SUBJECT_STR_W,
+        L"PencilBridge Local Server",
+        nullptr);
+    if (!gTlsServerCertificate)
+    {
+        CertCloseStore(gTlsCertificateStore, 0);
+        gTlsCertificateStore = nullptr;
+        return false;
+    }
+
+    SCHANNEL_CRED credential{};
+    credential.dwVersion = SCHANNEL_CRED_VERSION;
+    credential.cCreds = 1;
+    credential.paCred = &gTlsServerCertificate;
+    credential.dwFlags =
+        SCH_CRED_NO_DEFAULT_CREDS |
+        SCH_CRED_NO_SYSTEM_MAPPER;
+
+    TimeStamp expiry{};
+    const SECURITY_STATUS status =
+        AcquireCredentialsHandleW(
+            nullptr,
+            const_cast<wchar_t*>(UNISP_NAME_W),
+            SECPKG_CRED_INBOUND,
+            nullptr,
+            &credential,
+            nullptr,
+            nullptr,
+            &gTlsCredentials,
+            &expiry);
+
+    if (status != SEC_E_OK)
+    {
+        CertFreeCertificateContext(gTlsServerCertificate);
+        gTlsServerCertificate = nullptr;
+        CertCloseStore(gTlsCertificateStore, 0);
+        gTlsCertificateStore = nullptr;
+        return false;
+    }
+
+    gTlsCredentialsValid = true;
+    return true;
+}
+
+void ShutdownTlsCredentials()
+{
+    {
+        std::lock_guard lock(gTlsConnectionsMutex);
+        gTlsConnections.clear();
+    }
+
+    if (gTlsCredentialsValid)
+    {
+        FreeCredentialsHandle(&gTlsCredentials);
+        gTlsCredentialsValid = false;
+    }
+
+    if (gTlsServerCertificate)
+    {
+        CertFreeCertificateContext(gTlsServerCertificate);
+        gTlsServerCertificate = nullptr;
+    }
+
+    if (gTlsCertificateStore)
+    {
+        CertCloseStore(gTlsCertificateStore, 0);
+        gTlsCertificateStore = nullptr;
+    }
+}
+
+bool AcceptTlsConnection(
+    SOCKET socket,
+    const std::shared_ptr<TlsConnection>& connection)
+{
+    if (!gTlsCredentialsValid || !connection)
+    {
+        return false;
+    }
+
+    constexpr DWORD requestFlags =
+        ASC_REQ_SEQUENCE_DETECT |
+        ASC_REQ_REPLAY_DETECT |
+        ASC_REQ_CONFIDENTIALITY |
+        ASC_REQ_EXTENDED_ERROR |
+        ASC_REQ_STREAM |
+        ASC_REQ_ALLOCATE_MEMORY;
+
+    std::vector<uint8_t> incoming;
+    incoming.reserve(32 * 1024);
+
+    while (gRunning.load())
+    {
+        if (incoming.empty())
+        {
+            std::array<uint8_t, 16 * 1024> buffer{};
+            const int received =
+                RawRecvSome(
+                    socket,
+                    reinterpret_cast<char*>(buffer.data()),
+                    static_cast<int>(buffer.size()));
+            if (received <= 0)
+            {
+                return false;
+            }
+            incoming.insert(
+                incoming.end(),
+                buffer.begin(),
+                buffer.begin() + received);
+        }
+
+        SecBuffer inputBuffers[2]{};
+        inputBuffers[0].BufferType = SECBUFFER_TOKEN;
+        inputBuffers[0].pvBuffer = incoming.data();
+        inputBuffers[0].cbBuffer =
+            static_cast<unsigned long>(incoming.size());
+        inputBuffers[1].BufferType = SECBUFFER_EMPTY;
+
+        SecBufferDesc inputDesc{};
+        inputDesc.ulVersion = SECBUFFER_VERSION;
+        inputDesc.cBuffers = 2;
+        inputDesc.pBuffers = inputBuffers;
+
+        SecBuffer outputBuffer{};
+        outputBuffer.BufferType = SECBUFFER_TOKEN;
+
+        SecBufferDesc outputDesc{};
+        outputDesc.ulVersion = SECBUFFER_VERSION;
+        outputDesc.cBuffers = 1;
+        outputDesc.pBuffers = &outputBuffer;
+
+        DWORD attributes = 0;
+        TimeStamp expiry{};
+
+        const SECURITY_STATUS status =
+            AcceptSecurityContext(
+                &gTlsCredentials,
+                connection->contextValid
+                    ? &connection->context
+                    : nullptr,
+                &inputDesc,
+                requestFlags,
+                SECURITY_NATIVE_DREP,
+                &connection->context,
+                &outputDesc,
+                &attributes,
+                &expiry);
+
+        if (outputBuffer.pvBuffer &&
+            outputBuffer.cbBuffer > 0)
+        {
+            const bool sent =
+                RawSendAll(
+                    socket,
+                    static_cast<const char*>(
+                        outputBuffer.pvBuffer),
+                    outputBuffer.cbBuffer);
+            FreeContextBuffer(outputBuffer.pvBuffer);
+            outputBuffer.pvBuffer = nullptr;
+
+            if (!sent)
+            {
+                return false;
+            }
+        }
+
+        if (status == SEC_E_INCOMPLETE_MESSAGE)
+        {
+            std::array<uint8_t, 16 * 1024> buffer{};
+            const int received =
+                RawRecvSome(
+                    socket,
+                    reinterpret_cast<char*>(buffer.data()),
+                    static_cast<int>(buffer.size()));
+            if (received <= 0)
+            {
+                return false;
+            }
+            incoming.insert(
+                incoming.end(),
+                buffer.begin(),
+                buffer.begin() + received);
+            continue;
+        }
+
+        if (status != SEC_E_OK &&
+            status != SEC_I_CONTINUE_NEEDED)
+        {
+            if (connection->contextValid)
+            {
+                DeleteSecurityContext(
+                    &connection->context);
+                connection->contextValid = false;
+            }
+            return false;
+        }
+
+        connection->contextValid = true;
+
+        size_t extraBytes = 0;
+        if (inputBuffers[1].BufferType ==
+            SECBUFFER_EXTRA)
+        {
+            extraBytes =
+                inputBuffers[1].cbBuffer;
+        }
+
+        if (extraBytes > 0 &&
+            extraBytes <= incoming.size())
+        {
+            std::vector<uint8_t> extra(
+                incoming.end() -
+                    static_cast<std::ptrdiff_t>(
+                        extraBytes),
+                incoming.end());
+            incoming.swap(extra);
+        }
+        else
+        {
+            incoming.clear();
+        }
+
+        if (status == SEC_I_CONTINUE_NEEDED)
+        {
+            continue;
+        }
+
+        if (QueryContextAttributesW(
+                &connection->context,
+                SECPKG_ATTR_STREAM_SIZES,
+                &connection->streamSizes) != SEC_E_OK)
+        {
+            return false;
+        }
+
+        connection->encryptedPending =
+            std::move(incoming);
+        return true;
+    }
+
+    return false;
+}
+
+bool TlsSendAll(
+    const std::shared_ptr<TlsConnection>& connection,
+    SOCKET socket,
+    const char* data,
+    size_t size)
+{
+    if (!connection ||
+        !connection->contextValid)
+    {
+        return false;
+    }
+
+    std::lock_guard lock(connection->sendMutex);
+
+    size_t sent = 0;
+    while (sent < size)
+    {
+        const size_t maxMessage =
+            std::max<size_t>(
+                1,
+                connection->streamSizes.cbMaximumMessage);
+        const size_t chunkSize =
+            std::min(size - sent, maxMessage);
+
+        std::vector<uint8_t> packet(
+            static_cast<size_t>(
+                connection->streamSizes.cbHeader) +
+            chunkSize +
+            static_cast<size_t>(
+                connection->streamSizes.cbTrailer));
+
+        uint8_t* dataStart =
+            packet.data() +
+            connection->streamSizes.cbHeader;
+        std::memcpy(
+            dataStart,
+            data + sent,
+            chunkSize);
+
+        SecBuffer buffers[4]{};
+        buffers[0].BufferType = SECBUFFER_STREAM_HEADER;
+        buffers[0].pvBuffer = packet.data();
+        buffers[0].cbBuffer =
+            connection->streamSizes.cbHeader;
+
+        buffers[1].BufferType = SECBUFFER_DATA;
+        buffers[1].pvBuffer = dataStart;
+        buffers[1].cbBuffer =
+            static_cast<unsigned long>(chunkSize);
+
+        buffers[2].BufferType = SECBUFFER_STREAM_TRAILER;
+        buffers[2].pvBuffer =
+            dataStart + chunkSize;
+        buffers[2].cbBuffer =
+            connection->streamSizes.cbTrailer;
+
+        buffers[3].BufferType = SECBUFFER_EMPTY;
+
+        SecBufferDesc desc{};
+        desc.ulVersion = SECBUFFER_VERSION;
+        desc.cBuffers = 4;
+        desc.pBuffers = buffers;
+
+        if (EncryptMessage(
+                &connection->context,
+                0,
+                &desc,
+                0) != SEC_E_OK)
+        {
+            return false;
+        }
+
+        const size_t encryptedSize =
+            static_cast<size_t>(
+                buffers[0].cbBuffer) +
+            static_cast<size_t>(
+                buffers[1].cbBuffer) +
+            static_cast<size_t>(
+                buffers[2].cbBuffer);
+
+        if (!RawSendAll(
+                socket,
+                reinterpret_cast<const char*>(
+                    packet.data()),
+                encryptedSize))
+        {
+            return false;
+        }
+
+        sent += chunkSize;
+    }
+
+    return true;
+}
+
+int TlsRecvSome(
+    const std::shared_ptr<TlsConnection>& connection,
+    SOCKET socket,
+    char* output,
+    int outputSize)
+{
+    if (!connection ||
+        !connection->contextValid ||
+        outputSize <= 0)
+    {
+        return -1;
+    }
+
+    std::lock_guard lock(connection->recvMutex);
+
+    auto copyPlain = [&]() -> int
+    {
+        if (connection->plainPending.empty())
+        {
+            return 0;
+        }
+
+        const size_t count =
+            std::min<size_t>(
+                connection->plainPending.size(),
+                static_cast<size_t>(outputSize));
+        std::memcpy(
+            output,
+            connection->plainPending.data(),
+            count);
+        connection->plainPending.erase(
+            connection->plainPending.begin(),
+            connection->plainPending.begin() +
+                static_cast<std::ptrdiff_t>(count));
+        return static_cast<int>(count);
+    };
+
+    if (const int copied = copyPlain();
+        copied > 0)
+    {
+        return copied;
+    }
+
+    while (gRunning.load())
+    {
+        if (connection->encryptedPending.empty())
+        {
+            std::array<uint8_t, 16 * 1024> buffer{};
+            const int received =
+                RawRecvSome(
+                    socket,
+                    reinterpret_cast<char*>(buffer.data()),
+                    static_cast<int>(buffer.size()));
+            if (received <= 0)
+            {
+                return received;
+            }
+            connection->encryptedPending.insert(
+                connection->encryptedPending.end(),
+                buffer.begin(),
+                buffer.begin() + received);
+        }
+
+        SecBuffer buffers[4]{};
+        buffers[0].BufferType = SECBUFFER_DATA;
+        buffers[0].pvBuffer =
+            connection->encryptedPending.data();
+        buffers[0].cbBuffer =
+            static_cast<unsigned long>(
+                connection->encryptedPending.size());
+        for (int i = 1; i < 4; ++i)
+        {
+            buffers[i].BufferType =
+                SECBUFFER_EMPTY;
+        }
+
+        SecBufferDesc desc{};
+        desc.ulVersion = SECBUFFER_VERSION;
+        desc.cBuffers = 4;
+        desc.pBuffers = buffers;
+
+        const SECURITY_STATUS status =
+            DecryptMessage(
+                &connection->context,
+                &desc,
+                0,
+                nullptr);
+
+        if (status == SEC_E_INCOMPLETE_MESSAGE)
+        {
+            std::array<uint8_t, 16 * 1024> buffer{};
+            const int received =
+                RawRecvSome(
+                    socket,
+                    reinterpret_cast<char*>(buffer.data()),
+                    static_cast<int>(buffer.size()));
+            if (received <= 0)
+            {
+                return received;
+            }
+            connection->encryptedPending.insert(
+                connection->encryptedPending.end(),
+                buffer.begin(),
+                buffer.begin() + received);
+            continue;
+        }
+
+        if (status == SEC_I_CONTEXT_EXPIRED)
+        {
+            return 0;
+        }
+
+        if (status != SEC_E_OK)
+        {
+            return -1;
+        }
+
+        std::vector<uint8_t> plaintext;
+        std::vector<uint8_t> extra;
+
+        for (SecBuffer& buffer : buffers)
+        {
+            if (buffer.BufferType == SECBUFFER_DATA &&
+                buffer.pvBuffer &&
+                buffer.cbBuffer > 0)
+            {
+                const auto* begin =
+                    static_cast<const uint8_t*>(
+                        buffer.pvBuffer);
+                plaintext.assign(
+                    begin,
+                    begin + buffer.cbBuffer);
+            }
+            else if (
+                buffer.BufferType == SECBUFFER_EXTRA &&
+                buffer.pvBuffer &&
+                buffer.cbBuffer > 0)
+            {
+                const auto* begin =
+                    static_cast<const uint8_t*>(
+                        buffer.pvBuffer);
+                extra.assign(
+                    begin,
+                    begin + buffer.cbBuffer);
+            }
+        }
+
+        connection->encryptedPending =
+            std::move(extra);
+        if (!plaintext.empty())
+        {
+            connection->plainPending =
+                std::move(plaintext);
+            return copyPlain();
+        }
+    }
+
+    return 0;
+}
+
+bool SendAll(SOCKET socket, const char* data, size_t size)
+{
+    if (auto tls = GetTlsConnection(socket))
+    {
+        return TlsSendAll(
+            tls,
+            socket,
+            data,
+            size);
+    }
+    return RawSendAll(socket, data, size);
+}
+
 bool SendAll(SOCKET socket, const std::string& data)
 {
-    return SendAll(socket, data.data(), data.size());
+    return SendAll(
+        socket,
+        data.data(),
+        data.size());
+}
+
+int RecvSome(SOCKET socket, char* data, int size)
+{
+    if (auto tls = GetTlsConnection(socket))
+    {
+        return TlsRecvSome(
+            tls,
+            socket,
+            data,
+            size);
+    }
+    return RawRecvSome(socket, data, size);
 }
 
 std::string Trim(std::string value)
@@ -608,7 +1228,14 @@ bool RecvExact(SOCKET socket, uint8_t* data, size_t size)
     size_t received = 0;
     while (received < size && gRunning.load())
     {
-        const int chunk = recv(socket, reinterpret_cast<char*>(data + received), static_cast<int>(size - received), 0);
+        const int chunk =
+            RecvSome(
+                socket,
+                reinterpret_cast<char*>(data + received),
+                static_cast<int>(
+                    std::min<size_t>(
+                        size - received,
+                        static_cast<size_t>(INT_MAX))));
         if (chunk <= 0)
         {
             return false;
@@ -2387,7 +3014,11 @@ bool ReadHttpRequest(SOCKET socket, std::string& request)
 
     while (request.find("\r\n\r\n") == std::string::npos)
     {
-        const int received = recv(socket, buffer.data(), static_cast<int>(buffer.size()), 0);
+        const int received =
+            RecvSome(
+                socket,
+                buffer.data(),
+                static_cast<int>(buffer.size()));
         if (received <= 0)
         {
             return false;
@@ -2421,9 +3052,21 @@ void HandleClient(SOCKET socket)
 {
     RegisterOpenClientSocket(socket);
 
+    auto tls =
+        std::make_shared<TlsConnection>();
+    if (!AcceptTlsConnection(socket, tls))
+    {
+        UnregisterOpenClientSocket(socket);
+        shutdown(socket, SD_BOTH);
+        closesocket(socket);
+        return;
+    }
+    RegisterTlsConnection(socket, tls);
+
     std::string request;
     if (!ReadHttpRequest(socket, request))
     {
+        UnregisterTlsConnection(socket);
         UnregisterOpenClientSocket(socket);
         closesocket(socket);
         return;
@@ -2470,9 +3113,309 @@ void HandleClient(SOCKET socket)
         SendHttp(socket, "404 Not Found", "text/plain; charset=utf-8", "Not found");
     }
 
+    UnregisterTlsConnection(socket);
     UnregisterOpenClientSocket(socket);
     shutdown(socket, SD_BOTH);
     closesocket(socket);
+}
+
+std::string ReadFileBytes(const std::string& path)
+{
+    std::ifstream file(
+        path,
+        std::ios::binary);
+    if (!file)
+    {
+        return {};
+    }
+
+    return std::string(
+        std::istreambuf_iterator<char>(file),
+        std::istreambuf_iterator<char>());
+}
+
+void SendRawHttp(
+    SOCKET socket,
+    std::string_view status,
+    std::string_view contentType,
+    std::string_view body,
+    std::string_view extraHeaders = {})
+{
+    std::ostringstream headers;
+    headers
+        << "HTTP/1.1 " << status << "\r\n"
+        << "Content-Type: " << contentType << "\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Cache-Control: no-store\r\n";
+    if (!extraHeaders.empty())
+    {
+        headers << extraHeaders;
+    }
+    headers << "Connection: close\r\n\r\n";
+
+    const std::string headerText =
+        headers.str();
+    RawSendAll(
+        socket,
+        headerText.data(),
+        headerText.size());
+    RawSendAll(
+        socket,
+        body.data(),
+        body.size());
+}
+
+bool ReadRawHttpRequest(
+    SOCKET socket,
+    std::string& request)
+{
+    request.clear();
+    std::array<char, 2048> buffer{};
+
+    while (request.find("\r\n\r\n") ==
+           std::string::npos)
+    {
+        const int received =
+            RawRecvSome(
+                socket,
+                buffer.data(),
+                static_cast<int>(buffer.size()));
+        if (received <= 0)
+        {
+            return false;
+        }
+
+        request.append(
+            buffer.data(),
+            static_cast<size_t>(received));
+        if (request.size() > 16 * 1024)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void HandleBootstrapClient(
+    SOCKET socket,
+    const std::string& ip)
+{
+    RegisterOpenClientSocket(socket);
+
+    std::string request;
+    if (!ReadRawHttpRequest(socket, request))
+    {
+        UnregisterOpenClientSocket(socket);
+        closesocket(socket);
+        return;
+    }
+
+    std::istringstream firstLine(request);
+    std::string method;
+    std::string path;
+    std::string version;
+    firstLine >> method >> path >> version;
+
+    if (method == "GET" &&
+        path == "/PencilBridge-CA.mobileconfig")
+    {
+        const std::string profile =
+            ReadFileBytes(
+                "Saved/PencilBridge/TLS/"
+                "PencilBridge-CA.mobileconfig");
+
+        if (profile.empty())
+        {
+            SendRawHttp(
+                socket,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "PencilBridge CA profile is missing. "
+                "Run Run.ps1 again.");
+        }
+        else
+        {
+            SendRawHttp(
+                socket,
+                "200 OK",
+                "application/x-apple-aspen-config",
+                profile,
+                "Content-Disposition: attachment; "
+                "filename=\"PencilBridge-CA.mobileconfig\"\r\n");
+        }
+    }
+    else if (method == "GET" &&
+             path == "/PencilBridge-CA.cer")
+    {
+        const std::string certificate =
+            ReadFileBytes(
+                "Saved/PencilBridge/TLS/"
+                "PencilBridge-CA.cer");
+
+        if (certificate.empty())
+        {
+            SendRawHttp(
+                socket,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "PencilBridge CA certificate is missing.");
+        }
+        else
+        {
+            SendRawHttp(
+                socket,
+                "200 OK",
+                "application/x-x509-ca-cert",
+                certificate,
+                "Content-Disposition: attachment; "
+                "filename=\"PencilBridge-CA.cer\"\r\n");
+        }
+    }
+    else if (method == "GET" &&
+             (path == "/" ||
+              path == "/index.html"))
+    {
+        const std::string secureUrl =
+            "https://" + ip + ":8765";
+
+        const std::string page =
+            "<!doctype html>"
+            "<meta name=\"viewport\" "
+            "content=\"width=device-width,initial-scale=1\">"
+            "<meta name=\"color-scheme\" content=\"dark\">"
+            "<title>PencilBridge HTTPS Setup</title>"
+            "<style>"
+            "body{font:17px -apple-system,BlinkMacSystemFont,"
+            "sans-serif;background:#111318;color:#e8ebef;"
+            "max-width:720px;margin:0 auto;padding:28px 20px;"
+            "line-height:1.45}"
+            "a{display:block;background:#2a7fff;color:white;"
+            "padding:14px 16px;border-radius:10px;"
+            "text-decoration:none;margin:14px 0}"
+            "code{background:#222730;padding:2px 5px;"
+            "border-radius:4px}"
+            "li{margin:12px 0}"
+            "</style>"
+            "<h1>PencilBridge HTTPS setup</h1>"
+            "<p>This is a one-time setup for this PencilBridge CA.</p>"
+            "<ol>"
+            "<li><a href=\"/PencilBridge-CA.mobileconfig\">"
+            "Download PencilBridge CA profile</a></li>"
+            "<li>Open <b>Settings → General → "
+            "VPN &amp; Device Management</b>, select "
+            "<b>PencilBridge Local HTTPS</b>, and install it.</li>"
+            "<li>Open <b>Settings → General → About → "
+            "Certificate Trust Settings</b> and enable "
+            "<b>full trust</b> for <b>PencilBridge Local CA</b>.</li>"
+            "<li><a href=\"" +
+            secureUrl +
+            "\">Open secure PencilBridge</a></li>"
+            "</ol>"
+            "<p>After this, use <code>" +
+            secureUrl +
+            "</code>. Safari will treat PencilBridge as a "
+            "secure context and the real Screen Wake Lock API "
+            "can be used.</p>";
+
+        SendRawHttp(
+            socket,
+            "200 OK",
+            "text/html; charset=utf-8",
+            page);
+    }
+    else
+    {
+        SendRawHttp(
+            socket,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "Not found");
+    }
+
+    UnregisterOpenClientSocket(socket);
+    shutdown(socket, SD_BOTH);
+    closesocket(socket);
+}
+
+void BootstrapServerMain()
+{
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+    {
+        return;
+    }
+
+    SOCKET listenSocket =
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            IPPROTO_TCP);
+    if (listenSocket == INVALID_SOCKET)
+    {
+        WSACleanup();
+        return;
+    }
+
+    gBootstrapListenSocket.store(listenSocket);
+
+    BOOL reuse = TRUE;
+    setsockopt(
+        listenSocket,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        reinterpret_cast<const char*>(&reuse),
+        sizeof(reuse));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr =
+        htonl(INADDR_ANY);
+    address.sin_port = htons(kBootstrapPort);
+
+    if (bind(
+            listenSocket,
+            reinterpret_cast<sockaddr*>(&address),
+            sizeof(address)) == SOCKET_ERROR ||
+        listen(listenSocket, 4) == SOCKET_ERROR)
+    {
+        closesocket(listenSocket);
+        gBootstrapListenSocket.store(
+            INVALID_SOCKET);
+        WSACleanup();
+        return;
+    }
+
+    const std::string ip = GetLocalIPv4();
+
+    while (gRunning.load())
+    {
+        SOCKET client =
+            accept(
+                listenSocket,
+                nullptr,
+                nullptr);
+        if (client == INVALID_SOCKET)
+        {
+            if (!gRunning.load())
+            {
+                break;
+            }
+            continue;
+        }
+
+        HandleBootstrapClient(client, ip);
+    }
+
+    const SOCKET current =
+        gBootstrapListenSocket.exchange(
+            INVALID_SOCKET);
+    if (current != INVALID_SOCKET)
+    {
+        closesocket(current);
+    }
+
+    WSACleanup();
 }
 
 void ServerMain()
@@ -2483,6 +3426,14 @@ void ServerMain()
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
     {
         PostStatus(L"Winsock startup failed.");
+        return;
+    }
+
+    if (!InitializeTlsCredentials())
+    {
+        PostStatus(
+            L"HTTPS certificate missing. Run PencilBridge with Run.ps1.");
+        WSACleanup();
         return;
     }
 
@@ -2506,18 +3457,21 @@ void ServerMain()
     if (bind(listenSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
         listen(listenSocket, 4) == SOCKET_ERROR)
     {
-        PostStatus(L"Could not listen on port 8765. Is another PencilBridge running?");
+        PostStatus(L"Could not listen on HTTPS port 8765. Is another PencilBridge running?");
         closesocket(listenSocket);
         gListenSocket.store(INVALID_SOCKET);
+        ShutdownTlsCredentials();
         WSACleanup();
         return;
     }
 
     const std::string ip = GetLocalIPv4();
     const std::wstring ready =
-        L"Waiting for iPad/browser on http://" +
+        L"HTTPS ready: https://" +
         std::wstring(ip.begin(), ip.end()) +
-        L":8765";
+        L":8765  |  first-time iPad setup: http://" +
+        std::wstring(ip.begin(), ip.end()) +
+        L":8764";
     PostStatus(ready);
 
     std::vector<std::thread> clientThreads;
@@ -2562,6 +3516,7 @@ void ServerMain()
     {
         closesocket(current);
     }
+    ShutdownTlsCredentials();
     WSACleanup();
 }
 
@@ -3539,6 +4494,14 @@ void StopServer()
         shutdown(listener, SD_BOTH);
         closesocket(listener);
     }
+
+    const SOCKET bootstrap =
+        gBootstrapListenSocket.exchange(INVALID_SOCKET);
+    if (bootstrap != INVALID_SOCKET)
+    {
+        shutdown(bootstrap, SD_BOTH);
+        closesocket(bootstrap);
+    }
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -3953,7 +4916,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     }
 
     const std::wstring url =
-        L"http://" + std::wstring(ip.begin(), ip.end()) + L":8765";
+        L"https://" +
+        std::wstring(ip.begin(), ip.end()) +
+        L":8765    setup: http://" +
+        std::wstring(ip.begin(), ip.end()) +
+        L":8764";
     SetWindowTextW(gUrlText, url.c_str());
 
     if (!gPenDevice)
@@ -3963,6 +4930,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
             L"Warning: Windows synthetic pen device creation failed. Finger mouse can still work.");
     }
 
+    gBootstrapThread =
+        std::thread(BootstrapServerMain);
     gServerThread = std::thread(ServerMain);
 
     MSG message{};
@@ -3976,6 +4945,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     if (gServerThread.joinable())
     {
         gServerThread.join();
+    }
+    if (gBootstrapThread.joinable())
+    {
+        gBootstrapThread.join();
     }
 
     if (gPenDevice)
