@@ -160,6 +160,21 @@ input[type=checkbox] { width: 20px; height: 20px; }
     padding: 8px 12px;
     border-bottom: 1px solid #2a2e36;
     background: #171a20;
+    min-width: 0;
+}
+.markup-toolbar label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    white-space: nowrap;
+    color: #d5d9e0;
+}
+.markup-toolbar .markup-finger-toggle {
+    font-size: 13px;
+}
+body.markup-active .pressure-controls,
+body.markup-active .metrics {
+    display: none;
 }
 .markup-toolbar button {
     border: 1px solid #3a414d;
@@ -184,7 +199,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
     align-items: center;
     justify-content: center;
     overflow: hidden;
-    padding: 10px;
+    padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
 }
 #markupCanvas {
     display: block;
@@ -235,6 +250,34 @@ input[type=checkbox] { width: 20px; height: 20px; }
     .status { order: 3; flex-basis: 100%; }
     .pressure-controls { grid-template-columns: 1fr; }
     .metrics { grid-template-columns: repeat(2, 1fr); }
+
+    body.markup-active header {
+        display: none;
+    }
+    .markup-toolbar {
+        flex-wrap: wrap;
+        gap: 7px 8px;
+        padding: calc(7px + env(safe-area-inset-top)) 8px 7px;
+    }
+    .markup-toolbar strong {
+        flex: 0 0 auto;
+    }
+    .markup-toolbar .spacer {
+        display: none;
+    }
+    .markup-toolbar input[type=range] {
+        width: min(34vw, 120px);
+    }
+    .markup-toolbar button {
+        padding: 7px 9px;
+        font-size: 13px;
+    }
+    .markup-toolbar .markup-finger-toggle {
+        font-size: 12px;
+    }
+    #markupStage {
+        padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
+    }
 }
 </style>
 </head>
@@ -273,7 +316,8 @@ input[type=checkbox] { width: 20px; height: 20px; }
     <div class="markup-toolbar">
         <strong>Markup</strong>
         <input id="markupColor" type="color" value="#ff3b30" aria-label="Markup color">
-        <label>Size <input id="markupSize" type="range" min="2" max="28" step="1" value="7"></label>
+        <label class="markup-size-control">Size <input id="markupSize" type="range" min="2" max="28" step="1" value="7"></label>
+        <label class="markup-finger-toggle"><input id="markupFingerDraw" type="checkbox"> Finger Draw</label>
         <button id="markupClear" type="button">Clear Markup</button>
         <div class="spacer"></div>
         <button id="markupClose" type="button">Close</button>
@@ -314,6 +358,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var markupCanvas = document.getElementById('markupCanvas');
     var markupColor = document.getElementById('markupColor');
     var markupSize = document.getElementById('markupSize');
+    var markupFingerDraw = document.getElementById('markupFingerDraw');
     var markupClear = document.getElementById('markupClear');
     var markupClose = document.getElementById('markupClose');
     var markupSend = document.getElementById('markupSend');
@@ -346,8 +391,12 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
     var markupImage = null;
     var markupDrawing = false;
+    var markupPointerId = null;
     var markupLastX = 0;
     var markupLastY = 0;
+    var markupDidMove = false;
+    var markupRect = null;
+    var markupUsesRawUpdate = ('onpointerrawupdate' in window);
 
     function loadNumber(key, fallback) {
         var value = Number(localStorage.getItem(key));
@@ -356,6 +405,24 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
     pressureMax.value = String(Math.max(0.40, Math.min(1.00, loadNumber('pencilbridge.pressureMax', 0.70))));
     pressureCurve.value = String(Math.max(0.35, Math.min(1.50, loadNumber('pencilbridge.pressureCurve', 0.80))));
+
+    function isLikelyPhone() {
+        return /iPhone|iPod/i.test(navigator.userAgent || '') ||
+            (navigator.maxTouchPoints > 0 &&
+             Math.min(window.screen.width, window.screen.height) <= 480);
+    }
+
+    var savedFingerDraw = localStorage.getItem('pencilbridge.markupFingerDraw');
+    markupFingerDraw.checked =
+        savedFingerDraw === null
+            ? isLikelyPhone()
+            : savedFingerDraw === '1';
+
+    markupFingerDraw.addEventListener('change', function () {
+        localStorage.setItem(
+            'pencilbridge.markupFingerDraw',
+            markupFingerDraw.checked ? '1' : '0');
+    });
 
     function refreshPressureControls() {
         pressureMaxValue.textContent = Number(pressureMax.value).toFixed(2);
@@ -446,12 +513,17 @@ input[type=checkbox] { width: 20px; height: 20px; }
             return;
         }
         var rect = markupStage.getBoundingClientRect();
+        var availableWidth = Math.max(1, rect.width - 12);
+        var availableHeight = Math.max(1, rect.height - 12);
         var scale = Math.min(
-            Math.max(1, rect.width - 20) / markupCanvas.width,
-            Math.max(1, rect.height - 20) / markupCanvas.height,
+            availableWidth / markupCanvas.width,
+            availableHeight / markupCanvas.height,
             1);
-        markupCanvas.style.width = Math.max(1, markupCanvas.width * scale) + 'px';
-        markupCanvas.style.height = Math.max(1, markupCanvas.height * scale) + 'px';
+        markupCanvas.style.width =
+            Math.max(1, Math.round(markupCanvas.width * scale)) + 'px';
+        markupCanvas.style.height =
+            Math.max(1, Math.round(markupCanvas.height * scale)) + 'px';
+        markupRect = null;
     }
 
     function redrawMarkupBase() {
@@ -474,8 +546,12 @@ input[type=checkbox] { width: 20px; height: 20px; }
             markupCanvas.width = image.naturalWidth;
             markupCanvas.height = image.naturalHeight;
             redrawMarkupBase();
+            markupDrawing = false;
+            markupPointerId = null;
+            markupRect = null;
             pad.style.display = 'none';
             markupView.style.display = 'flex';
+            document.body.classList.add('markup-active');
             requestAnimationFrame(fitMarkupCanvas);
             showGestureToast('CLIP READY');
         };
@@ -490,24 +566,74 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
     function closeMarkup() {
         markupDrawing = false;
+        markupPointerId = null;
+        markupRect = null;
         markupView.style.display = 'none';
+        document.body.classList.remove('markup-active');
         pad.style.display = '';
         refreshPadRect();
     }
 
+    function canDrawMarkup(event) {
+        if (event.pointerType === 'pen') {
+            return true;
+        }
+        return event.pointerType === 'touch' && markupFingerDraw.checked;
+    }
+
+    function markupPressure(event) {
+        if (event.pointerType === 'touch') {
+            return 0.5;
+        }
+
+        var pressure = Number(event.pressure || 0);
+        return Math.max(0.12, Math.min(1, pressure));
+    }
+
+    function refreshMarkupRect() {
+        markupRect = markupCanvas.getBoundingClientRect();
+    }
+
     function markupPoint(event) {
-        var rect = markupCanvas.getBoundingClientRect();
+        if (!markupRect) {
+            refreshMarkupRect();
+        }
+
         return {
-            x: (event.clientX - rect.left) * markupCanvas.width / Math.max(1, rect.width),
-            y: (event.clientY - rect.top) * markupCanvas.height / Math.max(1, rect.height)
+            x: (event.clientX - markupRect.left) *
+                markupCanvas.width / Math.max(1, markupRect.width),
+            y: (event.clientY - markupRect.top) *
+                markupCanvas.height / Math.max(1, markupRect.height)
         };
+    }
+
+    function markupBrushWidth(event) {
+        if (!markupRect) {
+            refreshMarkupRect();
+        }
+
+        // The slider describes visible-screen pixels. Convert that into source
+        // image pixels so the brush looks consistent on a phone or a large iPad.
+        var sourceScale =
+            markupCanvas.width / Math.max(1, markupRect.width);
+        return Number(markupSize.value) *
+            sourceScale *
+            (0.55 + markupPressure(event) * 0.9);
+    }
+
+    function stampMarkupPoint(event, x, y) {
+        var ctx = markupCanvas.getContext('2d');
+        var radius = Math.max(0.75, markupBrushWidth(event) * 0.5);
+        ctx.fillStyle = markupColor.value;
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.fill();
     }
 
     function drawMarkupSegment(event, fromX, fromY, toX, toY) {
         var ctx = markupCanvas.getContext('2d');
-        var pressure = Math.max(0.15, Number(event.pressure || 0.5));
         ctx.strokeStyle = markupColor.value;
-        ctx.lineWidth = Number(markupSize.value) * (0.55 + pressure * 0.9);
+        ctx.lineWidth = markupBrushWidth(event);
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.beginPath();
@@ -517,32 +643,53 @@ input[type=checkbox] { width: 20px; height: 20px; }
     }
 
     markupCanvas.addEventListener('pointerdown', function (event) {
-        if (event.pointerType !== 'pen') {
+        if (!canDrawMarkup(event) || markupDrawing) {
             return;
         }
+
         event.preventDefault();
+        event.stopPropagation();
+        refreshMarkupRect();
+
         var point = markupPoint(event);
         markupDrawing = true;
+        markupPointerId = event.pointerId;
+        markupDidMove = false;
         markupLastX = point.x;
         markupLastY = point.y;
+
+        // Draw immediately. Very quick handwriting marks can otherwise be only
+        // DOWN/UP with no MOVE event between them.
+        stampMarkupPoint(event, point.x, point.y);
+
         try { markupCanvas.setPointerCapture(event.pointerId); } catch (_) {}
     }, { passive: false });
 
-    markupCanvas.addEventListener('pointermove', function (event) {
-        if (!markupDrawing || event.pointerType !== 'pen') {
+    function handleMarkupMove(event) {
+        if (!markupDrawing ||
+            event.pointerId !== markupPointerId ||
+            !canDrawMarkup(event)) {
             return;
         }
-        event.preventDefault();
 
-        var samples = (typeof event.getCoalescedEvents === 'function')
-            ? event.getCoalescedEvents()
-            : [];
+        event.preventDefault();
+        event.stopPropagation();
+
+        var samples = [];
+        if (!markupUsesRawUpdate &&
+            typeof event.getCoalescedEvents === 'function') {
+            samples = event.getCoalescedEvents();
+        }
         if (!samples || samples.length === 0) {
             samples = [event];
         }
 
         for (var i = 0; i < samples.length; ++i) {
             var point = markupPoint(samples[i]);
+            if (point.x === markupLastX && point.y === markupLastY) {
+                continue;
+            }
+
             drawMarkupSegment(
                 samples[i],
                 markupLastX,
@@ -551,22 +698,53 @@ input[type=checkbox] { width: 20px; height: 20px; }
                 point.y);
             markupLastX = point.x;
             markupLastY = point.y;
+            markupDidMove = true;
         }
-    }, { passive: false });
+    }
 
-    function endMarkupStroke(event) {
-        if (event.pointerType !== 'pen') {
+    markupCanvas.addEventListener(
+        markupUsesRawUpdate ? 'pointerrawupdate' : 'pointermove',
+        handleMarkupMove,
+        { passive: false });
+
+    function endMarkupStroke(event, cancelled) {
+        if (!canDrawMarkup(event) ||
+            event.pointerId !== markupPointerId) {
             return;
         }
+
         event.preventDefault();
-        if (markupDrawing) {
-            markupDrawing = false;
+        event.stopPropagation();
+
+        if (markupDrawing && !cancelled) {
+            var point = markupPoint(event);
+            if (point.x !== markupLastX || point.y !== markupLastY) {
+                drawMarkupSegment(
+                    event,
+                    markupLastX,
+                    markupLastY,
+                    point.x,
+                    point.y);
+                markupLastX = point.x;
+                markupLastY = point.y;
+                markupDidMove = true;
+            }
         }
+
+        markupDrawing = false;
+        markupPointerId = null;
+        markupDidMove = false;
+        markupRect = null;
         try { markupCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
     }
 
-    markupCanvas.addEventListener('pointerup', endMarkupStroke, { passive: false });
-    markupCanvas.addEventListener('pointercancel', endMarkupStroke, { passive: false });
+    markupCanvas.addEventListener('pointerup', function (event) {
+        endMarkupStroke(event, false);
+    }, { passive: false });
+
+    markupCanvas.addEventListener('pointercancel', function (event) {
+        endMarkupStroke(event, true);
+    }, { passive: false });
 
     ['click', 'dblclick', 'contextmenu', 'dragstart', 'selectstart'].forEach(function (type) {
         markupCanvas.addEventListener(type, function (event) {
@@ -594,6 +772,17 @@ input[type=checkbox] { width: 20px; height: 20px; }
             if (selection && selection.rangeCount > 0) {
                 selection.removeAllRanges();
             }
+        }
+    });
+
+    markupFingerDraw.addEventListener('change', function () {
+        if (!markupFingerDraw.checked &&
+            markupDrawing &&
+            markupPointerId !== null) {
+            markupDrawing = false;
+            markupPointerId = null;
+            markupDidMove = false;
+            markupRect = null;
         }
     });
 
@@ -1050,7 +1239,11 @@ input[type=checkbox] { width: 20px; height: 20px; }
         fitMarkupCanvas();
     });
     window.addEventListener('orientationchange', function () {
-        setTimeout(refreshPadRect, 50);
+        setTimeout(function () {
+            refreshPadRect();
+            markupRect = null;
+            fitMarkupCanvas();
+        }, 50);
     });
 
     refreshPadRect();
