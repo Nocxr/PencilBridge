@@ -578,7 +578,9 @@ body.markup-active .metrics {
 
 
     function fitMarkupCanvas() {
-        if (!markupCanvas.width || !markupCanvas.height || markupView.style.display === 'none') {
+        if (!markupCanvas.width ||
+            !markupCanvas.height ||
+            !document.body.classList.contains('markup-active')) {
             return;
         }
         var rect = markupStage.getBoundingClientRect();
@@ -1077,7 +1079,7 @@ body.markup-active .metrics {
     });
 
     document.addEventListener('selectionchange', function () {
-        if (markupView.style.display !== 'none' && window.getSelection) {
+        if (document.body.classList.contains('markup-active') && window.getSelection) {
             var selection = window.getSelection();
             if (selection && selection.rangeCount > 0) {
                 selection.removeAllRanges();
@@ -1659,7 +1661,7 @@ body.markup-active .metrics {
 
     pad.addEventListener('touchstart', function (event) {
         if (!useNativeIosTouchInk ||
-            markupView.style.display !== 'none') {
+            document.body.classList.contains('markup-active')) {
             return;
         }
 
@@ -1702,7 +1704,7 @@ body.markup-active .metrics {
 
     pad.addEventListener('touchmove', function (event) {
         if (!useNativeIosTouchInk ||
-            markupView.style.display !== 'none') {
+            document.body.classList.contains('markup-active')) {
             return;
         }
 
@@ -1750,7 +1752,7 @@ body.markup-active .metrics {
 
     pad.addEventListener('touchend', function (event) {
         if (!useNativeIosTouchInk ||
-            markupView.style.display !== 'none') {
+            document.body.classList.contains('markup-active')) {
             return;
         }
 
@@ -1807,7 +1809,7 @@ body.markup-active .metrics {
 
     pad.addEventListener('touchcancel', function (event) {
         if (!useNativeIosTouchInk ||
-            markupView.style.display !== 'none') {
+            document.body.classList.contains('markup-active')) {
             return;
         }
 
