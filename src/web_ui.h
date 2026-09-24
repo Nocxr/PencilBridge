@@ -213,6 +213,10 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var penRestarts = 0;
     var penCancels = 0;
     var peakPressure = 0;
+    var padRect = null;
+    var latestTelemetry = null;
+    var lastInputTime = 0;
+    var recentMaxGapMs = 0;
 
     function loadNumber(key, fallback) {
         var value = Number(localStorage.getItem(key));
@@ -286,30 +290,51 @@ input[type=checkbox] { width: 20px; height: 20px; }
         });
     }
 
+    function refreshPadRect() {
+        padRect = pad.getBoundingClientRect();
+    }
+
     function normalized(event) {
-        var rect = pad.getBoundingClientRect();
+        if (!padRect) {
+            refreshPadRect();
+        }
+        var rect = padRect;
         var x = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
         var y = Math.max(0, Math.min(1, (event.clientY - rect.top) / Math.max(1, rect.height)));
         return { x: x, y: y, rect: rect };
     }
 
-    function updateReadout(event, point) {
-        var type = event.pointerType || 'unknown';
-        var rawPressure = Number(event.pressure || 0);
+    function queueTelemetry(event, point) {
+        latestTelemetry = {
+            pointerType: event.pointerType || 'unknown',
+            pressure: Number(event.pressure || 0),
+            tiltX: Math.round(event.tiltX || 0),
+            tiltY: Math.round(event.tiltY || 0),
+            clientX: event.clientX,
+            clientY: event.clientY,
+            x: point.x,
+            y: point.y
+        };
+    }
+
+    function updateReadout(sample) {
+        var type = sample.pointerType;
+        var rawPressure = sample.pressure;
         var outputPressure = type === 'pen' ? mappedPressure(rawPressure) : rawPressure;
         if (type === 'pen' && rawPressure > peakPressure) {
             peakPressure = rawPressure;
         }
         deviceText.textContent = type === 'pen' ? 'Apple Pencil / pen' : type;
         pressureMetric.textContent = rawPressure.toFixed(3) + ' → ' + outputPressure.toFixed(3);
-        tiltText.textContent = Math.round(event.tiltX || 0) + '°, ' + Math.round(event.tiltY || 0) + '°';
+        tiltText.textContent = sample.tiltX + '°, ' + sample.tiltY + '°';
         positionText.textContent =
-            point.x.toFixed(3) + ', ' + point.y.toFixed(3) +
-            '  r' + penRestarts + '/c' + penCancels;
+            sample.x.toFixed(3) + ', ' + sample.y.toFixed(3) +
+            '  r' + penRestarts + '/c' + penCancels +
+            '  gap≤' + recentMaxGapMs.toFixed(0) + 'ms';
 
         cursor.style.display = 'block';
-        cursor.style.left = (event.clientX - point.rect.left) + 'px';
-        cursor.style.top = (event.clientY - point.rect.top) + 'px';
+        cursor.style.left = (sample.clientX - padRect.left) + 'px';
+        cursor.style.top = (sample.clientY - padRect.top) + 'px';
         var p = outputPressure;
         var scale = 0.8 + p * 0.8;
         cursor.style.transform = 'scale(' + scale.toFixed(2) + ')';
@@ -364,8 +389,17 @@ input[type=checkbox] { width: 20px; height: 20px; }
             }
         }
 
+        var now = performance.now();
+        if (lastInputTime > 0) {
+            var gap = now - lastInputTime;
+            if (gap > recentMaxGapMs) {
+                recentMaxGapMs = gap;
+            }
+        }
+        lastInputTime = now;
+
         var point = normalized(event);
-        updateReadout(event, point);
+        queueTelemetry(event, point);
 
         var device = event.pointerType === 'pen' ? 'p' : 't';
         var message = [
@@ -440,6 +474,24 @@ input[type=checkbox] { width: 20px; height: 20px; }
     pad.addEventListener('contextmenu', function (event) {
         event.preventDefault();
     });
+
+    function telemetryFrame() {
+        if (latestTelemetry) {
+            updateReadout(latestTelemetry);
+            latestTelemetry = null;
+        }
+        // Decay the displayed worst gap so old stalls don't stick forever.
+        recentMaxGapMs *= 0.985;
+        requestAnimationFrame(telemetryFrame);
+    }
+
+    window.addEventListener('resize', refreshPadRect);
+    window.addEventListener('orientationchange', function () {
+        setTimeout(refreshPadRect, 50);
+    });
+
+    refreshPadRect();
+    requestAnimationFrame(telemetryFrame);
 
     window.addEventListener('pagehide', function () {
         if (socket) {

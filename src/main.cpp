@@ -607,19 +607,17 @@ bool MapPenToTarget(
         outTarget);
 }
 
-bool ParseDouble(const std::string& text, double& value)
+bool ParseDouble(std::string_view text, double& value)
 {
-    char* end = nullptr;
-    const double parsed = std::strtod(text.c_str(), &end);
-    if (end == text.c_str() || *end != '\0' || !std::isfinite(parsed))
-    {
-        return false;
-    }
-    value = parsed;
-    return true;
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    const auto result = std::from_chars(begin, end, value);
+    return result.ec == std::errc{} &&
+           result.ptr == end &&
+           std::isfinite(value);
 }
 
-bool ParseInt(const std::string& text, int& value)
+bool ParseInt(std::string_view text, int& value)
 {
     const char* begin = text.data();
     const char* end = begin + text.size();
@@ -629,23 +627,28 @@ bool ParseInt(const std::string& text, int& value)
 
 bool ParseInputEvent(const std::string& message, InputEvent& event)
 {
-    std::array<std::string, 8> parts;
+    std::array<std::string_view, 8> parts;
+    const std::string_view view(message);
     size_t partIndex = 0;
     size_t start = 0;
 
     while (partIndex < parts.size())
     {
-        const size_t comma = message.find(',', start);
-        if (comma == std::string::npos)
+        const size_t comma = view.find(',', start);
+        if (comma == std::string_view::npos)
         {
-            parts[partIndex++] = message.substr(start);
+            parts[partIndex++] = view.substr(start);
             break;
         }
-        parts[partIndex++] = message.substr(start, comma - start);
+
+        parts[partIndex++] = view.substr(start, comma - start);
         start = comma + 1;
     }
 
-    if (partIndex != parts.size() || parts[0].size() != 1 || parts[1].size() != 1)
+    if (partIndex != parts.size() ||
+        start < view.size() && view.find(',', start) != std::string_view::npos ||
+        parts[0].size() != 1 ||
+        parts[1].size() != 1)
     {
         return false;
     }
@@ -1139,6 +1142,8 @@ void HandleClient(SOCKET socket)
 
 void ServerMain()
 {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
     {
@@ -1183,6 +1188,17 @@ void ServerMain()
     while (gRunning.load())
     {
         SOCKET client = accept(listenSocket, nullptr, nullptr);
+        if (client != INVALID_SOCKET)
+        {
+            BOOL noDelay = TRUE;
+            setsockopt(
+                client,
+                IPPROTO_TCP,
+                TCP_NODELAY,
+                reinterpret_cast<const char*>(&noDelay),
+                sizeof(noDelay));
+        }
+
         if (client == INVALID_SOCKET)
         {
             if (!gRunning.load())
@@ -1328,7 +1344,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     RefreshVirtualDesktopGeometry();
 
-    gPenDevice = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT);
+    gPenDevice = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE);
 
     const wchar_t kClassName[] = L"PencilBridgeWindow";
 
