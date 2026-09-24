@@ -286,6 +286,7 @@ body.markup-active .metrics {
     <div class="brand">PencilBridge</div>
     <div class="status"><span id="dot" class="dot"></span><span id="statusText">Connecting…</span></div>
     <div class="spacer"></div>
+    <label class="toggle"><input id="fingerDraw" type="checkbox"> Finger draw</label>
     <label class="toggle"><input id="fingerMouse" type="checkbox"> Finger mouse</label>
 </header>
 
@@ -340,6 +341,7 @@ body.markup-active .metrics {
     var pad = document.getElementById('pad');
     var dot = document.getElementById('dot');
     var statusText = document.getElementById('statusText');
+    var fingerDraw = document.getElementById('fingerDraw');
     var fingerMouse = document.getElementById('fingerMouse');
     var deviceText = document.getElementById('device');
     var pressureMetric = document.getElementById('pressureMetric');
@@ -381,8 +383,10 @@ body.markup-active .metrics {
     var touchGestureMoved = false;
     var touchGestureCancelled = false;
     var pendingFingerDown = null;
+    var pendingFingerMode = null;
     var pendingFingerTimer = null;
     var activeFingerSample = null;
+    var activeFingerMode = null;
     var toastTimer = null;
 
     var GESTURE_MAX_MS = 420;
@@ -424,6 +428,24 @@ body.markup-active .metrics {
             markupFingerDraw.checked ? '1' : '0');
     });
 
+    var savedTabletFingerDraw =
+        localStorage.getItem('pencilbridge.fingerDraw');
+    fingerDraw.checked =
+        savedTabletFingerDraw === null
+            ? isLikelyPhone()
+            : savedTabletFingerDraw === '1';
+
+    fingerDraw.addEventListener('change', function () {
+        localStorage.setItem(
+            'pencilbridge.fingerDraw',
+            fingerDraw.checked ? '1' : '0');
+
+        if (fingerDraw.checked) {
+            fingerMouse.checked = false;
+        }
+        cancelActiveFinger();
+    });
+
     function refreshPressureControls() {
         pressureMaxValue.textContent = Number(pressureMax.value).toFixed(2);
         pressureCurveValue.textContent = Number(pressureCurve.value).toFixed(2);
@@ -458,14 +480,11 @@ body.markup-active .metrics {
     refreshPressureControls();
 
     fingerMouse.addEventListener('change', function () {
-        if (!fingerMouse.checked) {
-            clearPendingFingerTimer();
-            pendingFingerDown = null;
-            if (activeTouchId !== null && activeFingerSample) {
-                sendEvent(activeFingerSample, 'c');
-                activeFingerSample = null;
-            }
+        if (fingerMouse.checked) {
+            fingerDraw.checked = false;
+            localStorage.setItem('pencilbridge.fingerDraw', '0');
         }
+        cancelActiveFinger();
     });
 
     function setConnection(isLive, text) {
@@ -642,20 +661,11 @@ body.markup-active .metrics {
         ctx.stroke();
     }
 
-    function resetMarkupStroke(releaseCapture) {
-        var previousPointerId = markupPointerId;
+    function resetMarkupStroke() {
         markupDrawing = false;
         markupPointerId = null;
         markupDidMove = false;
         markupRect = null;
-
-        if (releaseCapture && previousPointerId !== null) {
-            try {
-                if (markupCanvas.hasPointerCapture(previousPointerId)) {
-                    markupCanvas.releasePointerCapture(previousPointerId);
-                }
-            } catch (_) {}
-        }
     }
 
     markupCanvas.addEventListener('pointerdown', function (event) {
@@ -671,7 +681,7 @@ body.markup-active .metrics {
         // JavaScript state: retire the old stroke and start this one immediately.
         if (markupDrawing || markupPointerId !== null) {
             markupRecoveredStrokes += 1;
-            resetMarkupStroke(true);
+            resetMarkupStroke();
         }
 
         refreshMarkupRect();
@@ -686,8 +696,6 @@ body.markup-active .metrics {
         // Draw immediately. Very quick handwriting marks can otherwise be only
         // DOWN/UP with no MOVE event between them.
         stampMarkupPoint(event, point.x, point.y);
-
-        try { markupCanvas.setPointerCapture(event.pointerId); } catch (_) {}
     }, { passive: false });
 
     function handleMarkupMove(event) {
@@ -726,10 +734,10 @@ body.markup-active .metrics {
         }
     }
 
-    markupCanvas.addEventListener(
+    window.addEventListener(
         'pointermove',
         handleMarkupMove,
-        { passive: false });
+        { capture: true, passive: false });
 
     function endMarkupStroke(event, cancelled) {
         if (event.pointerId !== markupPointerId) {
@@ -754,24 +762,24 @@ body.markup-active .metrics {
             }
         }
 
-        resetMarkupStroke(false);
-        try { markupCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+        resetMarkupStroke();
     }
 
-    markupCanvas.addEventListener('pointerup', function (event) {
-        endMarkupStroke(event, false);
-    }, { passive: false });
-
-    markupCanvas.addEventListener('pointercancel', function (event) {
-        endMarkupStroke(event, true);
-    }, { passive: false });
-
-    markupCanvas.addEventListener('lostpointercapture', function (event) {
-        if (event.pointerId === markupPointerId) {
-            markupRecoveredStrokes += 1;
-            resetMarkupStroke(false);
+    window.addEventListener('pointerup', function (event) {
+        if (markupDrawing && event.pointerId === markupPointerId) {
+            endMarkupStroke(event, false);
         }
-    });
+    }, { capture: true, passive: false });
+
+    // Do not let pointercancel poison the next stroke. Safari can cancel a
+    // Pencil sequence during fast handwriting; the next physical DOWN always
+    // resets stale state and starts cleanly.
+    window.addEventListener('pointercancel', function (event) {
+        if (markupDrawing && event.pointerId === markupPointerId) {
+            markupRecoveredStrokes += 1;
+            resetMarkupStroke();
+        }
+    }, { capture: true, passive: false });
 
     ['click', 'dblclick', 'contextmenu', 'dragstart', 'selectstart'].forEach(function (type) {
         markupCanvas.addEventListener(type, function (event) {
@@ -806,7 +814,7 @@ body.markup-active .metrics {
         if (!markupFingerDraw.checked &&
             markupDrawing &&
             markupPointerId !== null) {
-            resetMarkupStroke(true);
+            resetMarkupStroke();
         }
     });
 
@@ -925,16 +933,44 @@ body.markup-active .metrics {
         }
     }
 
+    function requestedFingerMode() {
+        if (fingerDraw.checked) {
+            return 'draw';
+        }
+        if (fingerMouse.checked) {
+            return 'mouse';
+        }
+        return null;
+    }
+
+    function cancelActiveFinger() {
+        clearPendingFingerTimer();
+        pendingFingerDown = null;
+        pendingFingerMode = null;
+
+        if (activeTouchId !== null && activeFingerSample) {
+            sendEvent(activeFingerSample, 'c');
+        }
+
+        activeFingerSample = null;
+        activeFingerMode = null;
+    }
+
     function commitPendingFingerDown() {
         clearPendingFingerTimer();
-        if (!pendingFingerDown || !fingerMouse.checked || touchGestureMaxCount >= 2) {
+        if (!pendingFingerDown ||
+            !pendingFingerMode ||
+            touchGestureMaxCount >= 2) {
             pendingFingerDown = null;
+            pendingFingerMode = null;
             return;
         }
 
+        activeFingerMode = pendingFingerMode;
         activeFingerSample = pendingFingerDown;
         sendEvent(pendingFingerDown, 'd');
         pendingFingerDown = null;
+        pendingFingerMode = null;
     }
 
     function beginTouchGesture(event) {
@@ -957,10 +993,12 @@ body.markup-active .metrics {
         if (touchGestureMaxCount >= 2) {
             clearPendingFingerTimer();
             pendingFingerDown = null;
+            pendingFingerMode = null;
 
             if (activeTouchId !== null && activeFingerSample) {
                 sendEvent(activeFingerSample, 'c');
                 activeFingerSample = null;
+                activeFingerMode = null;
             }
         }
     }
@@ -1020,7 +1058,9 @@ body.markup-active .metrics {
             return true;
         }
         if (event.pointerType === 'touch') {
-            return fingerMouse.checked;
+            return activeFingerMode !== null ||
+                pendingFingerMode !== null ||
+                requestedFingerMode() !== null;
         }
         return false;
     }
@@ -1030,14 +1070,19 @@ body.markup-active .metrics {
             return;
         }
 
-        if (event.pointerType === 'pen') {
+        var penLike =
+            event.pointerType === 'pen' ||
+            (event.pointerType === 'touch' && activeFingerMode === 'draw');
+
+        if (penLike) {
             if (phase === 'd') {
                 penActive = true;
             } else if (phase === 'm' && !penActive) {
                 // Safari can occasionally cancel/recreate a Pencil pointer during a
                 // continuous physical contact. If pressure says the tip is still down,
                 // transparently begin a fresh synthetic stroke instead of going silent.
-                if (Number(event.pressure || 0) > 0.001) {
+                if (event.pointerType === 'touch' ||
+                    Number(event.pressure || 0) > 0.001) {
                     penActive = true;
                     penRestarts += 1;
                     phase = 'd';
@@ -1061,7 +1106,7 @@ body.markup-active .metrics {
         }
 
         var now = performance.now();
-        if (event.pointerType === 'pen') {
+        if (penLike) {
             if (phase === 'd') {
                 lastInputTime = now;
                 strokeMaxGapMs = 0;
@@ -1081,15 +1126,16 @@ body.markup-active .metrics {
         var point = normalized(event);
         queueTelemetry(event, point);
 
-        var device = event.pointerType === 'pen' ? 'p' : 't';
+        var device = penLike ? 'p' : 't';
+        var outputPressure = event.pointerType === 'pen'
+            ? mappedPressure(event.pressure)
+            : (penLike ? 0.55 : Number(event.pressure || 0));
         var message = [
             device,
             phase,
             point.x.toFixed(6),
             point.y.toFixed(6),
-            (event.pointerType === 'pen'
-                ? mappedPressure(event.pressure)
-                : Number(event.pressure || 0)).toFixed(6),
+            outputPressure.toFixed(6),
             String(Math.round(event.tiltX || 0)),
             String(Math.round(event.tiltY || 0)),
             String(event.pointerId || 0)
@@ -1097,7 +1143,7 @@ body.markup-active .metrics {
 
         socket.send(message);
 
-        if (event.pointerType === 'pen' && (phase === 'u' || phase === 'c')) {
+        if (penLike && (phase === 'u' || phase === 'c')) {
             penActive = false;
         }
 
@@ -1108,21 +1154,24 @@ body.markup-active .metrics {
 
     pad.addEventListener('pointerdown', function (event) {
         if (event.pointerType === 'touch') {
+            var mode = requestedFingerMode();
+            if (!mode) {
+                return;
+            }
+
             event.preventDefault();
             beginTouchGesture(event);
-            try { pad.setPointerCapture(event.pointerId); } catch (_) {}
 
             if (touchGestureMaxCount >= 2) {
                 return;
             }
 
-            if (fingerMouse.checked) {
-                pendingFingerDown = snapshotPointer(event);
-                clearPendingFingerTimer();
-                pendingFingerTimer = setTimeout(
-                    commitPendingFingerDown,
-                    FINGER_MOUSE_DELAY_MS);
-            }
+            pendingFingerDown = snapshotPointer(event);
+            pendingFingerMode = mode;
+            clearPendingFingerTimer();
+            pendingFingerTimer = setTimeout(
+                commitPendingFingerDown,
+                FINGER_MOUSE_DELAY_MS);
             return;
         }
 
@@ -1131,7 +1180,13 @@ body.markup-active .metrics {
         }
 
         event.preventDefault();
-        try { pad.setPointerCapture(event.pointerId); } catch (_) {}
+
+        // A fresh physical Pencil DOWN always starts a fresh bridge stroke.
+        // Do not depend on Safari pointer-capture state from the prior stroke.
+        if (penActive) {
+            penCancels += 1;
+            penActive = false;
+        }
         sendEvent(event, 'd');
     }, { passive: false });
 
@@ -1144,7 +1199,7 @@ body.markup-active .metrics {
                 return;
             }
 
-            if (fingerMouse.checked) {
+            if (pendingFingerMode || activeFingerMode) {
                 var sample = snapshotPointer(event);
                 if (pendingFingerDown) {
                     var dx = sample.clientX - pendingFingerDown.clientX;
@@ -1170,12 +1225,22 @@ body.markup-active .metrics {
         sendEvent(event, 'm');
     }, { passive: false });
 
-    pad.addEventListener('pointerup', function (event) {
+    window.addEventListener('pointerup', function (event) {
+        if (markupDrawing) {
+            return;
+        }
+
         if (event.pointerType === 'touch') {
+            if (!touchGesture.has(event.pointerId) &&
+                event.pointerId !== activeTouchId) {
+                return;
+            }
+
             event.preventDefault();
             var multiTouch = finishTouchGesture(event, false);
 
-            if (!multiTouch && fingerMouse.checked) {
+            if (!multiTouch &&
+                (pendingFingerDown || activeTouchId !== null)) {
                 if (pendingFingerDown) {
                     commitPendingFingerDown();
                 }
@@ -1184,55 +1249,54 @@ body.markup-active .metrics {
                     var sample = snapshotPointer(event);
                     sendEvent(sample, 'u');
                     activeFingerSample = null;
+                    activeFingerMode = null;
                 }
             } else {
                 clearPendingFingerTimer();
                 pendingFingerDown = null;
+                pendingFingerMode = null;
+            }
+            return;
+        }
+
+        if (event.pointerType === 'pen' && penActive) {
+            event.preventDefault();
+            sendEvent(event, 'u');
+        }
+    }, { capture: true, passive: false });
+
+    window.addEventListener('pointercancel', function (event) {
+        if (markupDrawing) {
+            return;
+        }
+
+        if (event.pointerType === 'touch') {
+            if (!touchGesture.has(event.pointerId) &&
+                event.pointerId !== activeTouchId) {
+                return;
             }
 
-            try { pad.releasePointerCapture(event.pointerId); } catch (_) {}
-            return;
-        }
-
-        if (!shouldForward(event)) {
-            return;
-        }
-
-        event.preventDefault();
-        sendEvent(event, 'u');
-        try { pad.releasePointerCapture(event.pointerId); } catch (_) {}
-    }, { passive: false });
-
-    pad.addEventListener('pointercancel', function (event) {
-        if (event.pointerType === 'touch') {
             event.preventDefault();
             finishTouchGesture(event, true);
             clearPendingFingerTimer();
             pendingFingerDown = null;
+            pendingFingerMode = null;
 
             if (activeTouchId !== null && activeFingerSample) {
                 sendEvent(activeFingerSample, 'c');
-                activeFingerSample = null;
             }
+            activeFingerSample = null;
+            activeFingerMode = null;
             return;
         }
 
-        if (!shouldForward(event)) {
-            return;
-        }
-        if (event.pointerType === 'pen') {
+        if (event.pointerType === 'pen' && penActive) {
+            event.preventDefault();
             penCancels += 1;
+            sendEvent(event, 'c');
+            penActive = false;
         }
-        sendEvent(event, 'c');
-        penActive = false;
-        activeTouchId = null;
-    }, { passive: false });
-
-    pad.addEventListener('lostpointercapture', function (event) {
-        if (event.pointerType === 'pen' && penActive && Number(event.pressure || 0) > 0.001) {
-            penCancels += 1;
-        }
-    });
+    }, { capture: true, passive: false });
 
     pad.addEventListener('contextmenu', function (event) {
         event.preventDefault();
@@ -1274,6 +1338,9 @@ body.markup-active .metrics {
     requestAnimationFrame(telemetryFrame);
 
     window.addEventListener('pagehide', function () {
+        resetMarkupStroke();
+        cancelActiveFinger();
+        penActive = false;
         if (socket) {
             socket.close();
         }
