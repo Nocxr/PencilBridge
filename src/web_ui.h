@@ -44,6 +44,39 @@ label.toggle {
     white-space: nowrap;
 }
 input[type=checkbox] { width: 20px; height: 20px; }
+.pressure-controls {
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    border-bottom: 1px solid #2a2e36;
+    background: #14171c;
+}
+.pressure-control {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-size: 12px;
+    color: #c7ccd5;
+}
+.pressure-control input[type=range] { width: 100%; min-width: 80px; }
+.pressure-control output {
+    min-width: 42px;
+    text-align: right;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.pressure-controls button {
+    border: 1px solid #3a414d;
+    border-radius: 7px;
+    background: #20252d;
+    color: #e4e7ec;
+    padding: 6px 10px;
+    font: inherit;
+}
 .metrics {
     display: grid;
     grid-template-columns: repeat(4, minmax(62px, 1fr));
@@ -114,6 +147,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
 @media (max-width: 650px) {
     header { flex-wrap: wrap; }
     .status { order: 3; flex-basis: 100%; }
+    .pressure-controls { grid-template-columns: 1fr; }
     .metrics { grid-template-columns: repeat(2, 1fr); }
 }
 </style>
@@ -126,9 +160,23 @@ input[type=checkbox] { width: 20px; height: 20px; }
     <label class="toggle"><input id="fingerMouse" type="checkbox"> Finger mouse</label>
 </header>
 
+<div class="pressure-controls">
+    <label class="pressure-control">
+        <span>Full pressure</span>
+        <input id="pressureMax" type="range" min="0.40" max="1.00" step="0.01" value="0.70">
+        <output id="pressureMaxValue">0.70</output>
+    </label>
+    <label class="pressure-control">
+        <span>Curve</span>
+        <input id="pressureCurve" type="range" min="0.35" max="1.50" step="0.05" value="0.80">
+        <output id="pressureCurveValue">0.80</output>
+    </label>
+    <button id="usePeak" type="button">Use peak</button>
+</div>
+
 <div class="metrics">
     <div class="metric"><b>Device</b><span id="device">—</span></div>
-    <div class="metric"><b>Pressure</b><span id="pressureMetric">0.000</span></div>
+    <div class="metric"><b>Pressure raw → out</b><span id="pressureMetric">0.000 → 0.000</span></div>
     <div class="metric"><b>Tilt</b><span id="tilt">0°, 0°</span></div>
     <div class="metric"><b>Position</b><span id="position">0.000, 0.000</span></div>
 </div>
@@ -148,6 +196,11 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var fingerMouse = document.getElementById('fingerMouse');
     var deviceText = document.getElementById('device');
     var pressureMetric = document.getElementById('pressureMetric');
+    var pressureMax = document.getElementById('pressureMax');
+    var pressureCurve = document.getElementById('pressureCurve');
+    var pressureMaxValue = document.getElementById('pressureMaxValue');
+    var pressureCurveValue = document.getElementById('pressureCurveValue');
+    var usePeak = document.getElementById('usePeak');
     var tiltText = document.getElementById('tilt');
     var positionText = document.getElementById('position');
     var cursor = document.getElementById('cursor');
@@ -157,6 +210,48 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var reconnectTimer = null;
     var activeTouchId = null;
     var penActive = false;
+    var peakPressure = 0;
+
+    function loadNumber(key, fallback) {
+        var value = Number(localStorage.getItem(key));
+        return Number.isFinite(value) ? value : fallback;
+    }
+
+    pressureMax.value = String(Math.max(0.40, Math.min(1.00, loadNumber('pencilbridge.pressureMax', 0.70))));
+    pressureCurve.value = String(Math.max(0.35, Math.min(1.50, loadNumber('pencilbridge.pressureCurve', 0.80))));
+
+    function refreshPressureControls() {
+        pressureMaxValue.textContent = Number(pressureMax.value).toFixed(2);
+        pressureCurveValue.textContent = Number(pressureCurve.value).toFixed(2);
+    }
+
+    function mappedPressure(raw) {
+        raw = Math.max(0, Math.min(1, Number(raw) || 0));
+        var maxValue = Math.max(0.01, Number(pressureMax.value) || 0.70);
+        var curve = Math.max(0.05, Number(pressureCurve.value) || 0.80);
+        var normalized = Math.max(0, Math.min(1, raw / maxValue));
+        return Math.pow(normalized, curve);
+    }
+
+    pressureMax.addEventListener('input', function () {
+        localStorage.setItem('pencilbridge.pressureMax', pressureMax.value);
+        refreshPressureControls();
+    });
+
+    pressureCurve.addEventListener('input', function () {
+        localStorage.setItem('pencilbridge.pressureCurve', pressureCurve.value);
+        refreshPressureControls();
+    });
+
+    usePeak.addEventListener('click', function () {
+        if (peakPressure > 0.05) {
+            pressureMax.value = String(Math.max(0.40, Math.min(1.00, peakPressure)).toFixed(2));
+            localStorage.setItem('pencilbridge.pressureMax', pressureMax.value);
+            refreshPressureControls();
+        }
+    });
+
+    refreshPressureControls();
 
     function setConnection(isLive, text) {
         dot.classList.toggle('live', isLive);
@@ -198,18 +293,26 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
     function updateReadout(event, point) {
         var type = event.pointerType || 'unknown';
+        var rawPressure = Number(event.pressure || 0);
+        var outputPressure = type === 'pen' ? mappedPressure(rawPressure) : rawPressure;
+        if (type === 'pen' && rawPressure > peakPressure) {
+            peakPressure = rawPressure;
+        }
         deviceText.textContent = type === 'pen' ? 'Apple Pencil / pen' : type;
-        pressureMetric.textContent = Number(event.pressure || 0).toFixed(3);
+        pressureMetric.textContent = rawPressure.toFixed(3) + ' → ' + outputPressure.toFixed(3);
         tiltText.textContent = Math.round(event.tiltX || 0) + '°, ' + Math.round(event.tiltY || 0) + '°';
         positionText.textContent = point.x.toFixed(3) + ', ' + point.y.toFixed(3);
 
         cursor.style.display = 'block';
         cursor.style.left = (event.clientX - point.rect.left) + 'px';
         cursor.style.top = (event.clientY - point.rect.top) + 'px';
-        var p = Number(event.pressure || 0);
+        var p = outputPressure;
         var scale = 0.8 + p * 0.8;
         cursor.style.transform = 'scale(' + scale.toFixed(2) + ')';
-        pressureText.textContent = type + '  pressure ' + p.toFixed(3);
+        pressureText.textContent =
+            type + '  raw ' + rawPressure.toFixed(3) +
+            '  out ' + outputPressure.toFixed(3) +
+            '  peak ' + peakPressure.toFixed(3);
     }
 
     function shouldForward(event) {
@@ -257,7 +360,9 @@ input[type=checkbox] { width: 20px; height: 20px; }
             phase,
             point.x.toFixed(6),
             point.y.toFixed(6),
-            Number(event.pressure || 0).toFixed(6),
+            (event.pointerType === 'pen'
+                ? mappedPressure(event.pressure)
+                : Number(event.pressure || 0)).toFixed(6),
             String(Math.round(event.tiltX || 0)),
             String(Math.round(event.tiltY || 0)),
             String(event.pointerId || 0)
