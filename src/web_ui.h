@@ -172,6 +172,11 @@ input[type=checkbox] { width: 20px; height: 20px; }
 .markup-toolbar .markup-finger-toggle {
     font-size: 13px;
 }
+.markup-input-mode {
+    color: #858d99;
+    font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: nowrap;
+}
 body.markup-active .pressure-controls,
 body.markup-active .metrics {
     display: none;
@@ -247,6 +252,24 @@ body.markup-active .metrics {
 }
 @media (max-width: 650px) {
     header { flex-wrap: wrap; }
+
+    body.phone-mode:not(.markup-active) .pressure-controls {
+        display: none;
+    }
+    body.phone-mode:not(.markup-active) .metrics {
+        grid-template-columns: repeat(2, 1fr);
+    }
+    body.phone-mode:not(.markup-active) header {
+        padding-left: 9px;
+        padding-right: 9px;
+        gap: 8px;
+    }
+    body.phone-mode:not(.markup-active) .brand {
+        font-size: 14px;
+    }
+    body.phone-mode:not(.markup-active) .status {
+        font-size: 12px;
+    }
     .status { order: 3; flex-basis: 100%; }
     .pressure-controls { grid-template-columns: 1fr; }
     .metrics { grid-template-columns: repeat(2, 1fr); }
@@ -315,7 +338,7 @@ body.markup-active .metrics {
 
 <section id="markupView">
     <div class="markup-toolbar">
-        <strong>Markup</strong>
+        <strong>Markup</strong><span id="markupInputMode" class="markup-input-mode"></span>
         <input id="markupColor" type="color" value="#ff3b30" aria-label="Markup color">
         <label class="markup-size-control">Size <input id="markupSize" type="range" min="2" max="28" step="1" value="7"></label>
         <label class="markup-finger-toggle"><input id="markupFingerDraw" type="checkbox"> Finger Draw</label>
@@ -356,6 +379,7 @@ body.markup-active .metrics {
     var pressureText = document.getElementById('pressure');
     var gestureToast = document.getElementById('gestureToast');
     var markupView = document.getElementById('markupView');
+    var markupInputMode = document.getElementById('markupInputMode');
     var markupStage = document.getElementById('markupStage');
     var markupCanvas = document.getElementById('markupCanvas');
     var markupColor = document.getElementById('markupColor');
@@ -401,6 +425,8 @@ body.markup-active .metrics {
     var markupDidMove = false;
     var markupRect = null;
     var markupRecoveredStrokes = 0;
+    var markupTouchId = null;
+    var markupTouchType = null;
 
     function loadNumber(key, fallback) {
         var value = Number(localStorage.getItem(key));
@@ -410,11 +436,28 @@ body.markup-active .metrics {
     pressureMax.value = String(Math.max(0.40, Math.min(1.00, loadNumber('pencilbridge.pressureMax', 0.70))));
     pressureCurve.value = String(Math.max(0.35, Math.min(1.50, loadNumber('pencilbridge.pressureCurve', 0.80))));
 
+    function isAppleTouchDevice() {
+        var ua = navigator.userAgent || '';
+        return /iPad|iPhone|iPod/i.test(ua) ||
+            (navigator.platform === 'MacIntel' &&
+             navigator.maxTouchPoints > 1);
+    }
+
     function isLikelyPhone() {
         return /iPhone|iPod/i.test(navigator.userAgent || '') ||
             (navigator.maxTouchPoints > 0 &&
              Math.min(window.screen.width, window.screen.height) <= 480);
     }
+
+    var useNativeIosTouchInk =
+        isAppleTouchDevice() && ('ontouchstart' in window);
+
+    if (isLikelyPhone()) {
+        document.body.classList.add('phone-mode');
+    }
+
+    markupInputMode.textContent =
+        useNativeIosTouchInk ? 'iOS native ink' : 'pointer ink';
 
     var savedFingerDraw = localStorage.getItem('pencilbridge.markupFingerDraw');
     markupFingerDraw.checked =
@@ -600,59 +643,71 @@ body.markup-active .metrics {
         return event.pointerType === 'touch' && markupFingerDraw.checked;
     }
 
-    function markupPressure(event) {
-        if (event.pointerType === 'touch') {
-            return 0.5;
-        }
-
-        var pressure = Number(event.pressure || 0);
-        return Math.max(0.12, Math.min(1, pressure));
-    }
-
     function refreshMarkupRect() {
         markupRect = markupCanvas.getBoundingClientRect();
     }
 
-    function markupPoint(event) {
+    function markupPointFromClient(clientX, clientY) {
         if (!markupRect) {
             refreshMarkupRect();
         }
 
         return {
-            x: (event.clientX - markupRect.left) *
+            x: (clientX - markupRect.left) *
                 markupCanvas.width / Math.max(1, markupRect.width),
-            y: (event.clientY - markupRect.top) *
+            y: (clientY - markupRect.top) *
                 markupCanvas.height / Math.max(1, markupRect.height)
         };
     }
 
-    function markupBrushWidth(event) {
+    function markupPoint(event) {
+        return markupPointFromClient(event.clientX, event.clientY);
+    }
+
+    function normalizedMarkupPressure(pointerType, pressure) {
+        if (pointerType === 'touch') {
+            return 0.5;
+        }
+
+        pressure = Number(pressure || 0);
+        return Math.max(0.12, Math.min(1, pressure));
+    }
+
+    function markupBrushWidthFor(pointerType, pressure) {
         if (!markupRect) {
             refreshMarkupRect();
         }
 
         // The slider describes visible-screen pixels. Convert that into source
-        // image pixels so the brush looks consistent on a phone or a large iPad.
+        // image pixels so the brush stays visually consistent at any fit scale.
         var sourceScale =
             markupCanvas.width / Math.max(1, markupRect.width);
         return Number(markupSize.value) *
             sourceScale *
-            (0.55 + markupPressure(event) * 0.9);
+            (0.55 + normalizedMarkupPressure(pointerType, pressure) * 0.9);
     }
 
-    function stampMarkupPoint(event, x, y) {
+    function stampMarkupPointFor(pointerType, pressure, x, y) {
         var ctx = markupCanvas.getContext('2d');
-        var radius = Math.max(0.75, markupBrushWidth(event) * 0.5);
+        var radius = Math.max(
+            0.75,
+            markupBrushWidthFor(pointerType, pressure) * 0.5);
         ctx.fillStyle = markupColor.value;
         ctx.beginPath();
         ctx.arc(x, y, radius, 0, Math.PI * 2);
         ctx.fill();
     }
 
-    function drawMarkupSegment(event, fromX, fromY, toX, toY) {
+    function drawMarkupSegmentFor(
+        pointerType,
+        pressure,
+        fromX,
+        fromY,
+        toX,
+        toY) {
         var ctx = markupCanvas.getContext('2d');
         ctx.strokeStyle = markupColor.value;
-        ctx.lineWidth = markupBrushWidth(event);
+        ctx.lineWidth = markupBrushWidthFor(pointerType, pressure);
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.beginPath();
@@ -661,15 +716,35 @@ body.markup-active .metrics {
         ctx.stroke();
     }
 
+    function stampMarkupPoint(event, x, y) {
+        stampMarkupPointFor(
+            event.pointerType,
+            event.pressure,
+            x,
+            y);
+    }
+
+    function drawMarkupSegment(event, fromX, fromY, toX, toY) {
+        drawMarkupSegmentFor(
+            event.pointerType,
+            event.pressure,
+            fromX,
+            fromY,
+            toX,
+            toY);
+    }
+
     function resetMarkupStroke() {
         markupDrawing = false;
         markupPointerId = null;
+        markupTouchId = null;
+        markupTouchType = null;
         markupDidMove = false;
         markupRect = null;
     }
 
     markupCanvas.addEventListener('pointerdown', function (event) {
-        if (!canDrawMarkup(event)) {
+        if (useNativeIosTouchInk || !canDrawMarkup(event)) {
             return;
         }
 
@@ -699,7 +774,8 @@ body.markup-active .metrics {
     }, { passive: false });
 
     function handleMarkupMove(event) {
-        if (!markupDrawing ||
+        if (useNativeIosTouchInk ||
+            !markupDrawing ||
             event.pointerId !== markupPointerId ||
             !canDrawMarkup(event)) {
             return;
@@ -766,7 +842,9 @@ body.markup-active .metrics {
     }
 
     window.addEventListener('pointerup', function (event) {
-        if (markupDrawing && event.pointerId === markupPointerId) {
+        if (!useNativeIosTouchInk &&
+            markupDrawing &&
+            event.pointerId === markupPointerId) {
             endMarkupStroke(event, false);
         }
     }, { capture: true, passive: false });
@@ -775,11 +853,201 @@ body.markup-active .metrics {
     // Pencil sequence during fast handwriting; the next physical DOWN always
     // resets stale state and starts cleanly.
     window.addEventListener('pointercancel', function (event) {
-        if (markupDrawing && event.pointerId === markupPointerId) {
+        if (!useNativeIosTouchInk &&
+            markupDrawing &&
+            event.pointerId === markupPointerId) {
             markupRecoveredStrokes += 1;
             resetMarkupStroke();
         }
     }, { capture: true, passive: false });
+
+    function touchKind(touch) {
+        return touch && touch.touchType === 'stylus'
+            ? 'pen'
+            : 'touch';
+    }
+
+    function canDrawMarkupTouch(touch) {
+        var kind = touchKind(touch);
+        return kind === 'pen' ||
+            (kind === 'touch' && markupFingerDraw.checked);
+    }
+
+    function findTouchById(list, identifier) {
+        for (var i = 0; i < list.length; ++i) {
+            if (list[i].identifier === identifier) {
+                return list[i];
+            }
+        }
+        return null;
+    }
+
+    function touchPressure(touch) {
+        var kind = touchKind(touch);
+        if (kind === 'touch') {
+            return 0.5;
+        }
+
+        var force = Number(touch.force || 0);
+        return Math.max(0.12, Math.min(1, force));
+    }
+
+    function beginMarkupTouch(touch) {
+        resetMarkupStroke();
+        refreshMarkupRect();
+
+        var kind = touchKind(touch);
+        var point = markupPointFromClient(
+            touch.clientX,
+            touch.clientY);
+
+        markupDrawing = true;
+        markupTouchId = touch.identifier;
+        markupTouchType = kind;
+        markupDidMove = false;
+        markupLastX = point.x;
+        markupLastY = point.y;
+
+        stampMarkupPointFor(
+            kind,
+            touchPressure(touch),
+            point.x,
+            point.y);
+    }
+
+    function moveMarkupTouch(touch) {
+        if (!markupDrawing ||
+            touch.identifier !== markupTouchId) {
+            return;
+        }
+
+        var point = markupPointFromClient(
+            touch.clientX,
+            touch.clientY);
+
+        if (point.x === markupLastX &&
+            point.y === markupLastY) {
+            return;
+        }
+
+        drawMarkupSegmentFor(
+            markupTouchType || touchKind(touch),
+            touchPressure(touch),
+            markupLastX,
+            markupLastY,
+            point.x,
+            point.y);
+
+        markupLastX = point.x;
+        markupLastY = point.y;
+        markupDidMove = true;
+    }
+
+    function endMarkupTouch(touch, cancelled) {
+        if (!markupDrawing ||
+            !touch ||
+            touch.identifier !== markupTouchId) {
+            return;
+        }
+
+        if (!cancelled) {
+            moveMarkupTouch(touch);
+        } else {
+            markupRecoveredStrokes += 1;
+        }
+
+        resetMarkupStroke();
+        markupTouchId = null;
+        markupTouchType = null;
+    }
+
+    markupCanvas.addEventListener('touchstart', function (event) {
+        if (!useNativeIosTouchInk) {
+            return;
+        }
+
+        for (var i = 0; i < event.changedTouches.length; ++i) {
+            var touch = event.changedTouches[i];
+            if (!canDrawMarkupTouch(touch)) {
+                continue;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+
+            // Touch identifiers are scoped to the physical contact, which avoids
+            // Safari PointerEvent pointer-id reuse / late-cancel corruption.
+            beginMarkupTouch(touch);
+            return;
+        }
+    }, { passive: false });
+
+    markupCanvas.addEventListener('touchmove', function (event) {
+        if (!useNativeIosTouchInk ||
+            !markupDrawing ||
+            markupTouchId === null) {
+            return;
+        }
+
+        var touch = findTouchById(
+            event.changedTouches,
+            markupTouchId);
+        if (!touch) {
+            touch = findTouchById(
+                event.touches,
+                markupTouchId);
+        }
+        if (!touch) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        moveMarkupTouch(touch);
+    }, { passive: false });
+
+    markupCanvas.addEventListener('touchend', function (event) {
+        if (!useNativeIosTouchInk ||
+            !markupDrawing ||
+            markupTouchId === null) {
+            return;
+        }
+
+        var touch = findTouchById(
+            event.changedTouches,
+            markupTouchId);
+        if (!touch) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        endMarkupTouch(touch, false);
+    }, { passive: false });
+
+    markupCanvas.addEventListener('touchcancel', function (event) {
+        if (!useNativeIosTouchInk ||
+            !markupDrawing ||
+            markupTouchId === null) {
+            return;
+        }
+
+        var touch = findTouchById(
+            event.changedTouches,
+            markupTouchId);
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (touch) {
+            endMarkupTouch(touch, true);
+        } else {
+            markupRecoveredStrokes += 1;
+            resetMarkupStroke();
+            markupTouchId = null;
+            markupTouchType = null;
+        }
+    }, { passive: false });
 
     ['click', 'dblclick', 'contextmenu', 'dragstart', 'selectstart'].forEach(function (type) {
         markupCanvas.addEventListener(type, function (event) {
