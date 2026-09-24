@@ -99,9 +99,12 @@ struct WhiteboardSegment
     double x2 = 0.0;
     double y2 = 0.0;
     int width = 4;
+    COLORREF color = RGB(255, 70, 60);
 };
 
 std::atomic<bool> gWhiteboardActive{false};
+std::atomic<int> gWhiteboardBrushSize{7};
+std::atomic<COLORREF> gWhiteboardBrushColor{RGB(255, 70, 60)};
 std::mutex gWhiteboardMutex;
 std::vector<WhiteboardSegment> gWhiteboardSegments;
 bool gWhiteboardStrokeActive = false;
@@ -157,8 +160,10 @@ bool gTouchInjectionReady = false;
 struct GestureTouchState
 {
     int id = -1;
+    UINT32 injectedId = 0;
     POINT point{};
     bool active = false;
+    bool primary = false;
 };
 
 std::array<GestureTouchState, 4> gGestureTouches{};
@@ -1643,8 +1648,141 @@ void SendKeyboardShortcut(WORD key)
     SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
 }
 
+void SendCtrlWheelZoom(int steps, double normalizedX, double normalizedY)
+{
+    if (steps == 0)
+    {
+        return;
+    }
+
+    POINT point{};
+    HWND target = nullptr;
+    if (!MapToTarget(
+            normalizedX,
+            normalizedY,
+            point,
+            target))
+    {
+        return;
+    }
+
+    std::lock_guard lock(gInputMutex);
+
+    if (!gScreenRectActive.load(std::memory_order_relaxed))
+    {
+        ActivateTargetWindow(target);
+    }
+
+    SetCursorPos(point.x, point.y);
+
+    INPUT ctrlDown{};
+    ctrlDown.type = INPUT_KEYBOARD;
+    ctrlDown.ki.wVk = VK_CONTROL;
+
+    INPUT wheel{};
+    wheel.type = INPUT_MOUSE;
+    wheel.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    wheel.mi.mouseData = static_cast<DWORD>(
+        static_cast<LONG>(std::clamp(steps, -8, 8) * WHEEL_DELTA));
+
+    INPUT ctrlUp{};
+    ctrlUp.type = INPUT_KEYBOARD;
+    ctrlUp.ki.wVk = VK_CONTROL;
+    ctrlUp.ki.dwFlags = KEYEVENTF_KEYUP;
+
+    std::array<INPUT, 3> inputs{
+        ctrlDown,
+        wheel,
+        ctrlUp};
+    SendInput(
+        static_cast<UINT>(inputs.size()),
+        inputs.data(),
+        sizeof(INPUT));
+}
+
 bool ProcessCommandMessage(std::string_view message)
 {
+    constexpr std::string_view zoomPrefix = "cmd,zoom,";
+    if (message.starts_with(zoomPrefix))
+    {
+        const std::string_view payload =
+            message.substr(zoomPrefix.size());
+        const size_t firstComma = payload.find(',');
+        const size_t secondComma =
+            firstComma == std::string_view::npos
+                ? std::string_view::npos
+                : payload.find(',', firstComma + 1);
+
+        int steps = 0;
+        double x = 0.5;
+        double y = 0.5;
+        if (firstComma != std::string_view::npos &&
+            secondComma != std::string_view::npos &&
+            ParseInt(payload.substr(0, firstComma), steps) &&
+            ParseDouble(
+                payload.substr(
+                    firstComma + 1,
+                    secondComma - firstComma - 1),
+                x) &&
+            ParseDouble(payload.substr(secondComma + 1), y))
+        {
+            SendCtrlWheelZoom(
+                steps,
+                std::clamp(x, 0.0, 1.0),
+                std::clamp(y, 0.0, 1.0));
+        }
+        return true;
+    }
+
+    constexpr std::string_view colorPrefix =
+        "cmd,whiteboard,color,";
+    if (message.starts_with(colorPrefix))
+    {
+        const std::string_view payload =
+            message.substr(colorPrefix.size());
+        const size_t firstComma = payload.find(',');
+        const size_t secondComma =
+            firstComma == std::string_view::npos
+                ? std::string_view::npos
+                : payload.find(',', firstComma + 1);
+
+        int red = 255;
+        int green = 70;
+        int blue = 60;
+        if (firstComma != std::string_view::npos &&
+            secondComma != std::string_view::npos &&
+            ParseInt(payload.substr(0, firstComma), red) &&
+            ParseInt(
+                payload.substr(
+                    firstComma + 1,
+                    secondComma - firstComma - 1),
+                green) &&
+            ParseInt(payload.substr(secondComma + 1), blue))
+        {
+            gWhiteboardBrushColor.store(
+                RGB(
+                    std::clamp(red, 0, 255),
+                    std::clamp(green, 0, 255),
+                    std::clamp(blue, 0, 255)),
+                std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    constexpr std::string_view sizePrefix =
+        "cmd,whiteboard,size,";
+    if (message.starts_with(sizePrefix))
+    {
+        int size = 7;
+        if (ParseInt(message.substr(sizePrefix.size()), size))
+        {
+            gWhiteboardBrushSize.store(
+                std::clamp(size, 1, 32),
+                std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     if (message == "cmd,undo")
     {
         SendKeyboardShortcut('Z');
@@ -1762,12 +1900,25 @@ GestureTouchState* AllocateGestureTouch(int id)
         return existing;
     }
 
-    for (GestureTouchState& touch : gGestureTouches)
+    bool hasActiveTouch = false;
+    for (const GestureTouchState& touch : gGestureTouches)
     {
+        if (touch.active)
+        {
+            hasActiveTouch = true;
+            break;
+        }
+    }
+
+    for (size_t index = 0; index < gGestureTouches.size(); ++index)
+    {
+        GestureTouchState& touch = gGestureTouches[index];
         if (!touch.active)
         {
             touch.id = id;
+            touch.injectedId = static_cast<UINT32>(index + 1);
             touch.active = true;
+            touch.primary = !hasActiveTouch;
             return &touch;
         }
     }
@@ -1790,19 +1941,21 @@ void FillTouchInfo(
 {
     ZeroMemory(&info, sizeof(info));
     info.pointerInfo.pointerType = PT_TOUCH;
-    info.pointerInfo.pointerId =
-        static_cast<UINT32>(std::max(1, touch.id + 1));
-    info.pointerInfo.pointerFlags = flags;
+    info.pointerInfo.pointerId = touch.injectedId;
+    info.pointerInfo.pointerFlags =
+        touch.primary
+            ? static_cast<POINTER_FLAGS>(flags | POINTER_FLAG_PRIMARY)
+            : flags;
     info.pointerInfo.ptPixelLocation = touch.point;
     info.touchFlags = TOUCH_FLAG_NONE;
     info.touchMask = static_cast<TOUCH_MASK>(
         TOUCH_MASK_CONTACTAREA |
         TOUCH_MASK_ORIENTATION |
         TOUCH_MASK_PRESSURE);
-    info.rcContact.left = touch.point.x - 2;
-    info.rcContact.top = touch.point.y - 2;
-    info.rcContact.right = touch.point.x + 2;
-    info.rcContact.bottom = touch.point.y + 2;
+    info.rcContact.left = touch.point.x - 4;
+    info.rcContact.top = touch.point.y - 4;
+    info.rcContact.right = touch.point.x + 4;
+    info.rcContact.bottom = touch.point.y + 4;
     info.orientation = 90;
     info.pressure = 512;
 }
@@ -1831,9 +1984,13 @@ void ReleaseGestureTouches()
             POINTER_FLAG_UP);
     }
 
-    if (count > 0)
+    if (count > 0 &&
+        !InjectTouchInput(count, infos.data()))
     {
-        InjectTouchInput(count, infos.data());
+        const DWORD error = GetLastError();
+        PostStatus(
+            L"Synthetic touch release failed. GetLastError=" +
+            std::to_wstring(error));
     }
 
     ClearGestureTouches();
@@ -1907,9 +2064,13 @@ void InjectGestureTouch(const InputEvent& event, POINT point, HWND target)
         FillTouchInfo(infos[count++], touch, flags);
     }
 
-    if (count > 0)
+    if (count > 0 &&
+        !InjectTouchInput(count, infos.data()))
     {
-        InjectTouchInput(count, infos.data());
+        const DWORD error = GetLastError();
+        PostStatus(
+            L"Synthetic touch gesture failed. GetLastError=" +
+            std::to_wstring(error));
     }
 
     if (event.phase == 'u' || event.phase == 'c')
@@ -1928,11 +2089,17 @@ void DrawWhiteboardInput(const InputEvent& event)
 
     std::lock_guard lock(gWhiteboardMutex);
 
+    const int baseSize =
+        gWhiteboardBrushSize.load(std::memory_order_relaxed);
     const int width =
         std::clamp(
-            2 + static_cast<int>(std::lround(event.pressure * 10.0)),
-            2,
-            12);
+            static_cast<int>(std::lround(
+                static_cast<double>(baseSize) *
+                (0.65 + event.pressure * 0.7))),
+            1,
+            48);
+    const COLORREF color =
+        gWhiteboardBrushColor.load(std::memory_order_relaxed);
 
     if (event.phase == 'd')
     {
@@ -1946,7 +2113,8 @@ void DrawWhiteboardInput(const InputEvent& event)
             event.y,
             event.x,
             event.y,
-            width});
+            width,
+            color});
     }
     else if (event.phase == 'm' && gWhiteboardStrokeActive)
     {
@@ -1955,7 +2123,8 @@ void DrawWhiteboardInput(const InputEvent& event)
             gWhiteboardLastY,
             event.x,
             event.y,
-            width});
+            width,
+            color});
 
         gWhiteboardLastX = event.x;
         gWhiteboardLastY = event.y;
@@ -1972,7 +2141,8 @@ void DrawWhiteboardInput(const InputEvent& event)
                 gWhiteboardLastY,
                 event.x,
                 event.y,
-                width});
+                width,
+            color});
         }
 
         gWhiteboardStrokeActive = false;
@@ -1980,7 +2150,11 @@ void DrawWhiteboardInput(const InputEvent& event)
 
     if (gWhiteboardWindow)
     {
-        InvalidateRect(gWhiteboardWindow, nullptr, FALSE);
+        RedrawWindow(
+            gWhiteboardWindow,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW);
     }
 }
 
@@ -2422,13 +2596,25 @@ LRESULT CALLBACK WhiteboardProc(
         const int width = std::max(1L, rect.right - rect.left);
         const int height = std::max(1L, rect.bottom - rect.top);
 
+        HPEN modePen = CreatePen(PS_SOLID, 2, RGB(255, 65, 180));
+        HGDIOBJ oldModePen = SelectObject(dc, modePen);
+        HGDIOBJ oldModeBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, 1, 1, std::max(2L, rect.right - 1), std::max(2L, rect.bottom - 1));
+        SelectObject(dc, oldModeBrush);
+        SelectObject(dc, oldModePen);
+        DeleteObject(modePen);
+
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 65, 180));
+        TextOutW(dc, 10, 8, L"WHITEBOARD", 10);
+
         std::lock_guard lock(gWhiteboardMutex);
         for (const WhiteboardSegment& segment : gWhiteboardSegments)
         {
             HPEN pen = CreatePen(
                 PS_SOLID,
                 segment.width,
-                RGB(255, 70, 60));
+                segment.color);
             HGDIOBJ oldPen = SelectObject(dc, pen);
 
             const int x1 =
@@ -2644,7 +2830,7 @@ HBITMAP CaptureMappingBitmap(const RECT& mapping)
             HPEN pen = CreatePen(
                 PS_SOLID,
                 segment.width,
-                RGB(255, 70, 60));
+                segment.color);
             HGDIOBJ oldPen = SelectObject(memoryDc, pen);
 
             const int x1 =
@@ -3673,6 +3859,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     gPenDevice = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE);
     gTouchInjectionReady =
         InitializeTouchInjection(10, TOUCH_FEEDBACK_NONE) != FALSE;
+    if (!gTouchInjectionReady)
+    {
+        PostStatus(
+            L"Warning: Windows touch injection initialization failed.");
+    }
 
     const wchar_t kClassName[] = L"PencilBridgeWindow";
 
