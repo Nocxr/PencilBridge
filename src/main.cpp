@@ -44,6 +44,7 @@ constexpr int ID_SELECT_ZONE_BUTTON = 1003;
 constexpr int ID_CLEAR_ZONE_BUTTON = 1004;
 constexpr int ID_SEND_CLIPBOARD_BUTTON = 1005;
 constexpr int ID_AUTO_CLIPBOARD_CHECK = 1006;
+constexpr int ID_SELECT_SCREEN_RECT_BUTTON = 1007;
 constexpr UINT_PTR ID_ZONE_TRACK_TIMER = 2001;
 constexpr int kPort = 8765;
 constexpr wchar_t kZoneSelectClassName[] = L"PencilBridgeZoneSelect";
@@ -79,6 +80,13 @@ std::atomic<double> gZoneY{0.0};
 std::atomic<double> gZoneWidth{1.0};
 std::atomic<double> gZoneHeight{1.0};
 
+std::atomic<bool> gScreenRectActive{false};
+std::atomic<int> gScreenRectLeft{0};
+std::atomic<int> gScreenRectTop{0};
+std::atomic<int> gScreenRectWidth{1};
+std::atomic<int> gScreenRectHeight{1};
+
+bool gSelectingScreenRect = false;
 bool gZoneDragging = false;
 POINT gZoneDragStart{};
 POINT gZoneDragCurrent{};
@@ -266,6 +274,7 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM)
 void ClearZone();
 void UpdateZoneOutline();
 void BeginZoneSelection();
+void BeginScreenRectSelection();
 
 bool ActivateTargetWindow(HWND target)
 {
@@ -1110,8 +1119,52 @@ bool MapWithGeometry(
     return true;
 }
 
+bool MapToScreenRect(
+    double normalizedX,
+    double normalizedY,
+    POINT& outPoint,
+    HWND& outTarget)
+{
+    if (!gScreenRectActive.load(std::memory_order_relaxed))
+    {
+        return false;
+    }
+
+    const int left = gScreenRectLeft.load(std::memory_order_relaxed);
+    const int top = gScreenRectTop.load(std::memory_order_relaxed);
+    const int width = std::max(
+        1,
+        gScreenRectWidth.load(std::memory_order_relaxed));
+    const int height = std::max(
+        1,
+        gScreenRectHeight.load(std::memory_order_relaxed));
+
+    normalizedX = std::clamp(normalizedX, 0.0, 1.0);
+    normalizedY = std::clamp(normalizedY, 0.0, 1.0);
+
+    outPoint.x =
+        left +
+        static_cast<LONG>(std::lround(
+            normalizedX * static_cast<double>(width - 1)));
+    outPoint.y =
+        top +
+        static_cast<LONG>(std::lround(
+            normalizedY * static_cast<double>(height - 1)));
+    outTarget = nullptr;
+    return true;
+}
+
 bool MapToTarget(double normalizedX, double normalizedY, POINT& outPoint, HWND& outTarget)
 {
+    if (gScreenRectActive.load(std::memory_order_relaxed))
+    {
+        return MapToScreenRect(
+            normalizedX,
+            normalizedY,
+            outPoint,
+            outTarget);
+    }
+
     TargetGeometry geometry;
     if (!CaptureTargetGeometry(gTargetWindow.load(), geometry))
     {
@@ -1138,6 +1191,15 @@ bool MapPenToTarget(
     POINT& outPoint,
     HWND& outTarget)
 {
+    if (gScreenRectActive.load(std::memory_order_relaxed))
+    {
+        return MapToScreenRect(
+            event.x,
+            event.y,
+            outPoint,
+            outTarget);
+    }
+
     const HWND selectedTarget = gTargetWindow.load();
 
     if (event.phase == 'd' ||
@@ -1327,11 +1389,14 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
             gPenInRange = false;
         }
 
-        ActivateTargetWindow(target);
-        if (!PointBelongsToTarget(point, target))
+        if (!gScreenRectActive.load(std::memory_order_relaxed))
         {
-            PostStatus(L"Input blocked: selected target is not visible at the mapped pen position.");
-            return;
+            ActivateTargetWindow(target);
+            if (!PointBelongsToTarget(point, target))
+            {
+                PostStatus(L"Input blocked: selected target is not visible at the mapped pen position.");
+                return;
+            }
         }
 
         // Windows Ink behaves more reliably when a pen enters range before first contact.
@@ -1486,11 +1551,14 @@ void InjectTouchMouse(const InputEvent& event, POINT point, HWND target)
         {
             return;
         }
-        ActivateTargetWindow(target);
-        if (!PointBelongsToTarget(point, target))
+        if (!gScreenRectActive.load(std::memory_order_relaxed))
         {
-            PostStatus(L"Input blocked: selected target is not visible at the mapped touch position.");
-            return;
+            ActivateTargetWindow(target);
+            if (!PointBelongsToTarget(point, target))
+            {
+                PostStatus(L"Input blocked: selected target is not visible at the mapped touch position.");
+                return;
+            }
         }
 
         gTouchDown = true;
@@ -1920,9 +1988,30 @@ void SetZoneStatusText()
         return;
     }
 
+    if (gScreenRectActive.load(std::memory_order_relaxed))
+    {
+        const int left =
+            gScreenRectLeft.load(std::memory_order_relaxed);
+        const int top =
+            gScreenRectTop.load(std::memory_order_relaxed);
+        const int width =
+            gScreenRectWidth.load(std::memory_order_relaxed);
+        const int height =
+            gScreenRectHeight.load(std::memory_order_relaxed);
+
+        const std::wstring text =
+            L"Screen rect: " +
+            std::to_wstring(width) + L"x" +
+            std::to_wstring(height) + L" @ " +
+            std::to_wstring(left) + L"," +
+            std::to_wstring(top);
+        SetWindowTextW(gZoneText, text.c_str());
+        return;
+    }
+
     if (!gZoneActive.load(std::memory_order_relaxed))
     {
-        SetWindowTextW(gZoneText, L"Zone: full window");
+        SetWindowTextW(gZoneText, L"Mapping: full selected window");
         return;
     }
 
@@ -1950,6 +2039,13 @@ void DestroyZoneOutline()
 
 void ClearZone()
 {
+    gScreenRectActive.store(false, std::memory_order_relaxed);
+    gScreenRectLeft.store(0, std::memory_order_relaxed);
+    gScreenRectTop.store(0, std::memory_order_relaxed);
+    gScreenRectWidth.store(1, std::memory_order_relaxed);
+    gScreenRectHeight.store(1, std::memory_order_relaxed);
+    gSelectingScreenRect = false;
+
     gZoneActive.store(false, std::memory_order_relaxed);
     gZoneTarget.store(nullptr, std::memory_order_relaxed);
     gZoneX.store(0.0, std::memory_order_relaxed);
@@ -2002,6 +2098,63 @@ LRESULT CALLBACK ZoneOutlineProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
 
 void UpdateZoneOutline()
 {
+    if (gScreenRectActive.load(std::memory_order_relaxed))
+    {
+        const int left =
+            gScreenRectLeft.load(std::memory_order_relaxed);
+        const int top =
+            gScreenRectTop.load(std::memory_order_relaxed);
+        const int width = std::max(
+            1,
+            gScreenRectWidth.load(std::memory_order_relaxed));
+        const int height = std::max(
+            1,
+            gScreenRectHeight.load(std::memory_order_relaxed));
+
+        if (!gZoneOutlineWindow || gZoneOutlineOwner != nullptr)
+        {
+            DestroyZoneOutline();
+
+            gZoneOutlineWindow = CreateWindowExW(
+                WS_EX_LAYERED |
+                    WS_EX_TRANSPARENT |
+                    WS_EX_TOOLWINDOW |
+                    WS_EX_NOACTIVATE,
+                kZoneOutlineClassName,
+                L"",
+                WS_POPUP,
+                0, 0, 1, 1,
+                nullptr,
+                nullptr,
+                gInstance,
+                nullptr);
+
+            if (!gZoneOutlineWindow)
+            {
+                return;
+            }
+
+            gZoneOutlineOwner = nullptr;
+            SetLayeredWindowAttributes(
+                gZoneOutlineWindow,
+                RGB(1, 2, 3),
+                255,
+                LWA_COLORKEY);
+        }
+
+        constexpr int margin = 4;
+        SetWindowPos(
+            gZoneOutlineWindow,
+            HWND_TOPMOST,
+            left - margin,
+            top - margin,
+            std::max(8, width + margin * 2),
+            std::max(8, height + margin * 2),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(gZoneOutlineWindow, nullptr, FALSE);
+        return;
+    }
+
     if (!gZoneActive.load(std::memory_order_relaxed))
     {
         if (gZoneOutlineWindow)
@@ -2123,7 +2276,42 @@ void CompleteZoneSelection(HWND hwnd)
         return;
     }
 
+    if (gSelectingScreenRect)
+    {
+        const int virtualX =
+            gVirtualDesktopX.load(std::memory_order_relaxed);
+        const int virtualY =
+            gVirtualDesktopY.load(std::memory_order_relaxed);
+
+        gScreenRectLeft.store(
+            virtualX + left,
+            std::memory_order_relaxed);
+        gScreenRectTop.store(
+            virtualY + top,
+            std::memory_order_relaxed);
+        gScreenRectWidth.store(
+            right - left,
+            std::memory_order_relaxed);
+        gScreenRectHeight.store(
+            bottom - top,
+            std::memory_order_relaxed);
+
+        gZoneActive.store(false, std::memory_order_relaxed);
+        gZoneTarget.store(nullptr, std::memory_order_relaxed);
+        gScreenRectActive.store(true, std::memory_order_release);
+        gPenTargetGeometry.valid = false;
+        gSelectingScreenRect = false;
+
+        DestroyZoneSelector();
+        SetZoneStatusText();
+        UpdateZoneOutline();
+        PostStatus(
+            L"Screen rect selected. Input now maps to this fixed desktop area regardless of the window underneath.");
+        return;
+    }
+
     const HWND target = gTargetWindow.load();
+    gScreenRectActive.store(false, std::memory_order_relaxed);
     gZoneTarget.store(target, std::memory_order_relaxed);
     gZoneX.store(static_cast<double>(left) / static_cast<double>(width), std::memory_order_relaxed);
     gZoneY.store(static_cast<double>(top) / static_cast<double>(height), std::memory_order_relaxed);
@@ -2136,7 +2324,7 @@ void CompleteZoneSelection(HWND hwnd)
     SetZoneStatusText();
     UpdateZoneOutline();
     ActivateTargetWindow(target);
-    PostStatus(L"Input zone selected. PencilBridge now maps the iPad into the outlined region.");
+    PostStatus(L"Window zone selected. PencilBridge now maps the iPad into the outlined region.");
 }
 
 LRESULT CALLBACK ZoneSelectProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -2173,6 +2361,7 @@ LRESULT CALLBACK ZoneSelectProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (wParam == VK_ESCAPE)
         {
             DestroyZoneSelector();
+            gSelectingScreenRect = false;
             UpdateZoneOutline();
             PostStatus(L"Zone selection cancelled.");
             return 0;
@@ -2199,7 +2388,9 @@ LRESULT CALLBACK ZoneSelectProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         instruction.top += 16;
         DrawTextW(
             dc,
-            L"Drag to define the PencilBridge input zone  |  Esc to cancel",
+            gSelectingScreenRect
+                ? L"Drag anywhere to define the fixed desktop screen rect  |  Esc to cancel"
+                : L"Drag to define the selected-window input zone  |  Esc to cancel",
             -1,
             &instruction,
             DT_CENTER | DT_TOP | DT_SINGLELINE);
@@ -2235,6 +2426,7 @@ LRESULT CALLBACK ZoneSelectProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 
 void BeginZoneSelection()
 {
+    gSelectingScreenRect = false;
     const HWND target = gTargetWindow.load();
     if (!target || !IsWindow(target) || !IsWindowVisible(target))
     {
@@ -2294,6 +2486,75 @@ void BeginZoneSelection()
     PostStatus(L"Drag over the part of the target window you want the iPad to control.");
 }
 
+void BeginScreenRectSelection()
+{
+    RefreshVirtualDesktopGeometry();
+
+    const int virtualX =
+        gVirtualDesktopX.load(std::memory_order_relaxed);
+    const int virtualY =
+        gVirtualDesktopY.load(std::memory_order_relaxed);
+    const int virtualWidth =
+        gVirtualDesktopWidth.load(std::memory_order_relaxed);
+    const int virtualHeight =
+        gVirtualDesktopHeight.load(std::memory_order_relaxed);
+
+    if (virtualWidth <= 1 || virtualHeight <= 1)
+    {
+        PostStatus(L"Could not determine the virtual desktop bounds.");
+        return;
+    }
+
+    if (gZoneOutlineWindow)
+    {
+        ShowWindow(gZoneOutlineWindow, SW_HIDE);
+    }
+
+    DestroyZoneSelector();
+    gSelectingScreenRect = true;
+    gZoneDragging = false;
+
+    gZoneSelectWindow = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        kZoneSelectClassName,
+        L"",
+        WS_POPUP | WS_VISIBLE,
+        virtualX,
+        virtualY,
+        virtualWidth,
+        virtualHeight,
+        nullptr,
+        nullptr,
+        gInstance,
+        nullptr);
+
+    if (!gZoneSelectWindow)
+    {
+        gSelectingScreenRect = false;
+        UpdateZoneOutline();
+        PostStatus(L"Could not create the screen-rect selector overlay.");
+        return;
+    }
+
+    SetLayeredWindowAttributes(
+        gZoneSelectWindow,
+        0,
+        150,
+        LWA_ALPHA);
+    SetWindowPos(
+        gZoneSelectWindow,
+        HWND_TOPMOST,
+        virtualX,
+        virtualY,
+        virtualWidth,
+        virtualHeight,
+        SWP_SHOWWINDOW);
+    SetForegroundWindow(gZoneSelectWindow);
+    SetFocus(gZoneSelectWindow);
+    PostStatus(
+        L"Drag anywhere on the desktop to define the fixed PencilBridge screen rect.");
+}
+
 void StopServer()
 {
     gRunning.store(false);
@@ -2345,16 +2606,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             20, 82, 110, 28,
             hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SELECT_ZONE_BUTTON)), nullptr, nullptr);
 
-        HWND clearZone = CreateWindowExW(
-            0, L"BUTTON", L"Clear Zone",
+        HWND selectScreenRect = CreateWindowExW(
+            0, L"BUTTON", L"Screen Rect",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            140, 82, 100, 28,
+            140, 82, 110, 28,
+            hwnd,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(ID_SELECT_SCREEN_RECT_BUTTON)),
+            nullptr,
+            nullptr);
+
+        HWND clearZone = CreateWindowExW(
+            0, L"BUTTON", L"Clear",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            260, 82, 80, 28,
             hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CLEAR_ZONE_BUTTON)), nullptr, nullptr);
 
         gZoneText = CreateWindowExW(
-            0, L"STATIC", L"Zone: full window",
+            0, L"STATIC", L"Mapping: full selected window",
             WS_CHILD | WS_VISIBLE,
-            255, 87, 415, 20,
+            355, 87, 315, 20,
             hwnd, nullptr, nullptr, nullptr);
 
         HWND sendClipboard = CreateWindowExW(
@@ -2398,6 +2669,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         ApplyDefaultFont(gTargetCombo);
         ApplyDefaultFont(refresh);
         ApplyDefaultFont(selectZone);
+        ApplyDefaultFont(selectScreenRect);
         ApplyDefaultFont(clearZone);
         ApplyDefaultFont(gZoneText);
         ApplyDefaultFont(sendClipboard);
@@ -2410,6 +2682,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         ApplyDarkControlTheme(gTargetCombo);
         ApplyDarkControlTheme(refresh);
         ApplyDarkControlTheme(selectZone);
+        ApplyDarkControlTheme(selectScreenRect);
         ApplyDarkControlTheme(clearZone);
         ApplyDarkControlTheme(sendClipboard);
         ApplyDarkControlTheme(gAutoClipboardCheck);
@@ -2436,10 +2709,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             BeginZoneSelection();
             return 0;
         }
+        if (LOWORD(wParam) == ID_SELECT_SCREEN_RECT_BUTTON &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            BeginScreenRectSelection();
+            return 0;
+        }
         if (LOWORD(wParam) == ID_CLEAR_ZONE_BUTTON && HIWORD(wParam) == BN_CLICKED)
         {
             ClearZone();
-            PostStatus(L"Input zone cleared. Mapping uses the full target client area.");
+            PostStatus(L"Mapping cleared. Input uses the full selected window.");
             return 0;
         }
         if (LOWORD(wParam) == ID_SEND_CLIPBOARD_BUTTON && HIWORD(wParam) == BN_CLICKED)
@@ -2510,7 +2789,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         MoveWindow(gTargetCombo, 20, 44, std::max(180, width - 150), 300, TRUE);
         HWND refresh = GetDlgItem(hwnd, ID_REFRESH_BUTTON);
         MoveWindow(refresh, std::max(20, width - 120), 44, 100, 28, TRUE);
-        MoveWindow(gZoneText, 255, 87, std::max(100, width - 275), 20, TRUE);
+        MoveWindow(gZoneText, 355, 87, std::max(100, width - 375), 20, TRUE);
         MoveWindow(gUrlText, 20, 188, std::max(100, width - 40), 24, TRUE);
         MoveWindow(gStatusText, 20, 228, std::max(100, width - 40), 44, TRUE);
         return 0;
