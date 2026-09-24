@@ -396,7 +396,7 @@ body.markup-active .metrics {
     var markupLastY = 0;
     var markupDidMove = false;
     var markupRect = null;
-    var markupUsesRawUpdate = ('onpointerrawupdate' in window);
+    var markupRecoveredStrokes = 0;
 
     function loadNumber(key, fallback) {
         var value = Number(localStorage.getItem(key));
@@ -642,13 +642,38 @@ body.markup-active .metrics {
         ctx.stroke();
     }
 
+    function resetMarkupStroke(releaseCapture) {
+        var previousPointerId = markupPointerId;
+        markupDrawing = false;
+        markupPointerId = null;
+        markupDidMove = false;
+        markupRect = null;
+
+        if (releaseCapture && previousPointerId !== null) {
+            try {
+                if (markupCanvas.hasPointerCapture(previousPointerId)) {
+                    markupCanvas.releasePointerCapture(previousPointerId);
+                }
+            } catch (_) {}
+        }
+    }
+
     markupCanvas.addEventListener('pointerdown', function (event) {
-        if (!canDrawMarkup(event) || markupDrawing) {
+        if (!canDrawMarkup(event)) {
             return;
         }
 
         event.preventDefault();
         event.stopPropagation();
+
+        // Safari can occasionally lose the UP/capture transition for a fast
+        // Pencil stroke. Never reject the next physical DOWN because of stale
+        // JavaScript state: retire the old stroke and start this one immediately.
+        if (markupDrawing || markupPointerId !== null) {
+            markupRecoveredStrokes += 1;
+            resetMarkupStroke(true);
+        }
+
         refreshMarkupRect();
 
         var point = markupPoint(event);
@@ -676,8 +701,7 @@ body.markup-active .metrics {
         event.stopPropagation();
 
         var samples = [];
-        if (!markupUsesRawUpdate &&
-            typeof event.getCoalescedEvents === 'function') {
+        if (typeof event.getCoalescedEvents === 'function') {
             samples = event.getCoalescedEvents();
         }
         if (!samples || samples.length === 0) {
@@ -703,13 +727,12 @@ body.markup-active .metrics {
     }
 
     markupCanvas.addEventListener(
-        markupUsesRawUpdate ? 'pointerrawupdate' : 'pointermove',
+        'pointermove',
         handleMarkupMove,
         { passive: false });
 
     function endMarkupStroke(event, cancelled) {
-        if (!canDrawMarkup(event) ||
-            event.pointerId !== markupPointerId) {
+        if (event.pointerId !== markupPointerId) {
             return;
         }
 
@@ -731,10 +754,7 @@ body.markup-active .metrics {
             }
         }
 
-        markupDrawing = false;
-        markupPointerId = null;
-        markupDidMove = false;
-        markupRect = null;
+        resetMarkupStroke(false);
         try { markupCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
     }
 
@@ -745,6 +765,13 @@ body.markup-active .metrics {
     markupCanvas.addEventListener('pointercancel', function (event) {
         endMarkupStroke(event, true);
     }, { passive: false });
+
+    markupCanvas.addEventListener('lostpointercapture', function (event) {
+        if (event.pointerId === markupPointerId) {
+            markupRecoveredStrokes += 1;
+            resetMarkupStroke(false);
+        }
+    });
 
     ['click', 'dblclick', 'contextmenu', 'dragstart', 'selectstart'].forEach(function (type) {
         markupCanvas.addEventListener(type, function (event) {
@@ -779,10 +806,7 @@ body.markup-active .metrics {
         if (!markupFingerDraw.checked &&
             markupDrawing &&
             markupPointerId !== null) {
-            markupDrawing = false;
-            markupPointerId = null;
-            markupDidMove = false;
-            markupRect = null;
+            resetMarkupStroke(true);
         }
     });
 

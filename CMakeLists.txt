@@ -21,8 +21,10 @@ target_compile_definitions(PencilBridge PRIVATE
 target_link_libraries(PencilBridge PRIVATE
     bcrypt
     crypt32
+    dwmapi
     ole32
     user32
+    uxtheme
     windowscodecs
     ws2_32
 )

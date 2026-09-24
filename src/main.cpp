@@ -2,6 +2,8 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
 #include <wincodec.h>
@@ -27,7 +29,9 @@
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ws2_32.lib")
 
@@ -61,6 +65,13 @@ HWND gZoneSelectWindow = nullptr;
 HWND gZoneOutlineWindow = nullptr;
 HWND gZoneOutlineOwner = nullptr;
 HINSTANCE gInstance = nullptr;
+HBRUSH gDarkBackgroundBrush = nullptr;
+HBRUSH gDarkControlBrush = nullptr;
+
+constexpr COLORREF kDarkBackground = RGB(17, 19, 24);
+constexpr COLORREF kDarkControl = RGB(28, 32, 39);
+constexpr COLORREF kDarkText = RGB(228, 231, 236);
+constexpr COLORREF kDarkMutedText = RGB(174, 180, 191);
 
 std::atomic<bool> gZoneActive{false};
 std::atomic<HWND> gZoneTarget{nullptr};
@@ -77,9 +88,10 @@ std::vector<WindowEntry> gWindows;
 std::atomic<HWND> gTargetWindow{nullptr};
 std::atomic<bool> gRunning{true};
 std::atomic<SOCKET> gListenSocket{INVALID_SOCKET};
-std::atomic<SOCKET> gClientSocket{INVALID_SOCKET};
 std::atomic<SOCKET> gWebSocketClient{INVALID_SOCKET};
 std::mutex gWebSocketSendMutex;
+std::mutex gOpenClientSocketsMutex;
+std::vector<SOCKET> gOpenClientSockets;
 std::thread gServerThread;
 
 IWICImagingFactory* gWicFactory = nullptr;
@@ -115,6 +127,66 @@ int gActiveTouchPointer = -1;
 void ApplyDefaultFont(HWND hwnd)
 {
     SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+}
+
+void ApplyDarkWindowTheme(HWND hwnd)
+{
+    if (!hwnd)
+    {
+        return;
+    }
+
+    const BOOL dark = TRUE;
+    constexpr DWMWINDOWATTRIBUTE kUseImmersiveDarkMode =
+        static_cast<DWMWINDOWATTRIBUTE>(20);
+    DwmSetWindowAttribute(
+        hwnd,
+        kUseImmersiveDarkMode,
+        &dark,
+        sizeof(dark));
+    SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
+}
+
+void ApplyDarkControlTheme(HWND hwnd)
+{
+    if (!hwnd)
+    {
+        return;
+    }
+
+    SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
+    SendMessageW(hwnd, WM_THEMECHANGED, 0, 0);
+}
+
+void RegisterOpenClientSocket(SOCKET socket)
+{
+    std::lock_guard lock(gOpenClientSocketsMutex);
+    gOpenClientSockets.push_back(socket);
+}
+
+void UnregisterOpenClientSocket(SOCKET socket)
+{
+    std::lock_guard lock(gOpenClientSocketsMutex);
+    const auto it = std::find(
+        gOpenClientSockets.begin(),
+        gOpenClientSockets.end(),
+        socket);
+    if (it != gOpenClientSockets.end())
+    {
+        gOpenClientSockets.erase(it);
+    }
+}
+
+void ShutdownOpenClientSockets()
+{
+    std::lock_guard lock(gOpenClientSocketsMutex);
+    for (SOCKET socket : gOpenClientSockets)
+    {
+        if (socket != INVALID_SOCKET)
+        {
+            shutdown(socket, SD_BOTH);
+        }
+    }
 }
 
 void PostStatus(const std::wstring& message)
@@ -1460,12 +1532,55 @@ void ProcessInputMessage(const std::string& message)
     }
 }
 
+void ReleaseActiveInputState()
+{
+    std::lock_guard lock(gInputMutex);
+
+    if (gTouchDown)
+    {
+        SendMouseButton(MOUSEEVENTF_LEFTUP);
+        gTouchDown = false;
+        gActiveTouchPointer = -1;
+    }
+
+    if (gPenDown && gPenDevice)
+    {
+        InjectPenPacket(
+            gLastPenScreenPoint,
+            POINTER_FLAG_UP | POINTER_FLAG_INRANGE,
+            0,
+            gLastPenTiltX,
+            gLastPenTiltY);
+        InjectPenPacket(
+            gLastPenScreenPoint,
+            POINTER_FLAG_UP,
+            0,
+            gLastPenTiltX,
+            gLastPenTiltY);
+    }
+
+    gPenDown = false;
+    gPenInRange = false;
+    gPenTargetGeometry.valid = false;
+}
+
 void WebSocketLoop(SOCKET socket)
 {
-    gWebSocketClient.store(socket);
-    PostStatus(L"iPad/browser connected. Input is live.");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
-    while (gRunning.load())
+    const SOCKET previous = gWebSocketClient.exchange(socket);
+    if (previous != INVALID_SOCKET && previous != socket)
+    {
+        shutdown(previous, SD_BOTH);
+        ReleaseActiveInputState();
+        PostStatus(L"New browser connection took over the active session.");
+    }
+    else
+    {
+        PostStatus(L"iPad/browser connected. Input is live.");
+    }
+
+    while (gRunning.load() && gWebSocketClient.load() == socket)
     {
         uint8_t header[2]{};
         if (!RecvExact(socket, header, sizeof(header)))
@@ -1527,6 +1642,11 @@ void WebSocketLoop(SOCKET socket)
             }
         }
 
+        if (gWebSocketClient.load() != socket)
+        {
+            break;
+        }
+
         if (opcode == 0x8)
         {
             {
@@ -1565,40 +1685,14 @@ void WebSocketLoop(SOCKET socket)
         }
     }
 
-    if (gWebSocketClient.load() == socket)
+    SOCKET expected = socket;
+    if (gWebSocketClient.compare_exchange_strong(
+            expected,
+            INVALID_SOCKET))
     {
-        gWebSocketClient.store(INVALID_SOCKET);
+        ReleaseActiveInputState();
+        PostStatus(L"Client disconnected. Waiting for iPad/browser...");
     }
-
-    {
-        std::lock_guard lock(gInputMutex);
-        if (gTouchDown)
-        {
-            SendMouseButton(MOUSEEVENTF_LEFTUP);
-            gTouchDown = false;
-            gActiveTouchPointer = -1;
-        }
-        if (gPenDown && gPenDevice)
-        {
-            InjectPenPacket(
-                gLastPenScreenPoint,
-                POINTER_FLAG_UP | POINTER_FLAG_INRANGE,
-                0,
-                gLastPenTiltX,
-                gLastPenTiltY);
-            InjectPenPacket(
-                gLastPenScreenPoint,
-                POINTER_FLAG_UP,
-                0,
-                gLastPenTiltX,
-                gLastPenTiltY);
-        }
-        gPenDown = false;
-        gPenInRange = false;
-        gPenTargetGeometry.valid = false;
-    }
-
-    PostStatus(L"Client disconnected. Waiting for iPad/browser...");
 }
 
 bool ReadHttpRequest(SOCKET socket, std::string& request)
@@ -1640,12 +1734,12 @@ void SendHttp(SOCKET socket, std::string_view status, std::string_view contentTy
 
 void HandleClient(SOCKET socket)
 {
-    gClientSocket.store(socket);
+    RegisterOpenClientSocket(socket);
 
     std::string request;
     if (!ReadHttpRequest(socket, request))
     {
-        gClientSocket.store(INVALID_SOCKET);
+        UnregisterOpenClientSocket(socket);
         closesocket(socket);
         return;
     }
@@ -1691,7 +1785,7 @@ void HandleClient(SOCKET socket)
         SendHttp(socket, "404 Not Found", "text/plain; charset=utf-8", "Not found");
     }
 
-    gClientSocket.store(INVALID_SOCKET);
+    UnregisterOpenClientSocket(socket);
     shutdown(socket, SD_BOTH);
     closesocket(socket);
 }
@@ -1741,6 +1835,8 @@ void ServerMain()
         L":8765";
     PostStatus(ready);
 
+    std::vector<std::thread> clientThreads;
+
     while (gRunning.load())
     {
         SOCKET client = accept(listenSocket, nullptr, nullptr);
@@ -1764,7 +1860,16 @@ void ServerMain()
             continue;
         }
 
-        HandleClient(client);
+        clientThreads.emplace_back(HandleClient, client);
+    }
+
+    ShutdownOpenClientSockets();
+    for (std::thread& clientThread : clientThreads)
+    {
+        if (clientThread.joinable())
+        {
+            clientThread.join();
+        }
     }
 
     const SOCKET current = gListenSocket.exchange(INVALID_SOCKET);
@@ -2172,12 +2277,13 @@ void StopServer()
 {
     gRunning.store(false);
 
-    const SOCKET client = gClientSocket.exchange(INVALID_SOCKET);
-    if (client != INVALID_SOCKET)
+    const SOCKET activeWebSocket = gWebSocketClient.exchange(INVALID_SOCKET);
+    if (activeWebSocket != INVALID_SOCKET)
     {
-        shutdown(client, SD_BOTH);
-        closesocket(client);
+        shutdown(activeWebSocket, SD_BOTH);
     }
+
+    ShutdownOpenClientSockets();
 
     const SOCKET listener = gListenSocket.exchange(INVALID_SOCKET);
     if (listener != INVALID_SOCKET)
@@ -2278,6 +2384,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         ApplyDefaultFont(gUrlText);
         ApplyDefaultFont(gStatusText);
 
+        ApplyDarkWindowTheme(hwnd);
+        ApplyDarkControlTheme(gTargetCombo);
+        ApplyDarkControlTheme(refresh);
+        ApplyDarkControlTheme(selectZone);
+        ApplyDarkControlTheme(clearZone);
+        ApplyDarkControlTheme(sendClipboard);
+        ApplyDarkControlTheme(gAutoClipboardCheck);
+
         AddClipboardFormatListener(hwnd);
         SetTimer(hwnd, ID_ZONE_TRACK_TIMER, 100, nullptr);
         return 0;
@@ -2322,6 +2436,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         }
         break;
+
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, kDarkText);
+        SetBkColor(dc, kDarkBackground);
+        SetBkMode(dc, TRANSPARENT);
+        return reinterpret_cast<LRESULT>(gDarkBackgroundBrush);
+    }
+
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, kDarkText);
+        SetBkColor(dc, kDarkControl);
+        return reinterpret_cast<LRESULT>(gDarkControlBrush);
+    }
 
     case WM_CLIPBOARDUPDATE:
         if (gIgnoreNextClipboardUpdate.exchange(false, std::memory_order_relaxed))
@@ -2389,6 +2522,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 {
     gInstance = instance;
+    gDarkBackgroundBrush = CreateSolidBrush(kDarkBackground);
+    gDarkControlBrush = CreateSolidBrush(kDarkControl);
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     RefreshVirtualDesktopGeometry();
@@ -2402,7 +2537,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     windowClass.hInstance = instance;
     windowClass.lpszClassName = kClassName;
     windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    windowClass.hbrBackground = gDarkBackgroundBrush;
 
     if (!RegisterClassW(&windowClass))
     {
@@ -2454,6 +2589,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         return 1;
     }
 
+    ApplyDarkWindowTheme(gMainWindow);
     ShowWindow(gMainWindow, showCommand);
     UpdateWindow(gMainWindow);
 
@@ -2508,6 +2644,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     if (SUCCEEDED(comResult))
     {
         CoUninitialize();
+    }
+
+    if (gDarkControlBrush)
+    {
+        DeleteObject(gDarkControlBrush);
+        gDarkControlBrush = nullptr;
+    }
+    if (gDarkBackgroundBrush)
+    {
+        DeleteObject(gDarkBackgroundBrush);
+        gDarkBackgroundBrush = nullptr;
     }
 
     return 0;
