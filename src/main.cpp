@@ -1459,10 +1459,22 @@ void CompleteZoneSelection(HWND hwnd)
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
 
-    const int left = std::clamp(std::min(gZoneDragStart.x, gZoneDragCurrent.x), 0, width);
-    const int right = std::clamp(std::max(gZoneDragStart.x, gZoneDragCurrent.x), 0, width);
-    const int top = std::clamp(std::min(gZoneDragStart.y, gZoneDragCurrent.y), 0, height);
-    const int bottom = std::clamp(std::max(gZoneDragStart.y, gZoneDragCurrent.y), 0, height);
+    const int left = static_cast<int>(std::clamp<LONG>(
+        std::min(gZoneDragStart.x, gZoneDragCurrent.x),
+        0L,
+        static_cast<LONG>(width)));
+    const int right = static_cast<int>(std::clamp<LONG>(
+        std::max(gZoneDragStart.x, gZoneDragCurrent.x),
+        0L,
+        static_cast<LONG>(width)));
+    const int top = static_cast<int>(std::clamp<LONG>(
+        std::min(gZoneDragStart.y, gZoneDragCurrent.y),
+        0L,
+        static_cast<LONG>(height)));
+    const int bottom = static_cast<int>(std::clamp<LONG>(
+        std::max(gZoneDragStart.y, gZoneDragCurrent.y),
+        0L,
+        static_cast<LONG>(height)));
 
     if (right - left < 12 || bottom - top < 12 || width <= 0 || height <= 0)
     {
