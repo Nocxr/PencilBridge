@@ -902,6 +902,51 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
     }
 }
 
+
+void SendKeyboardShortcut(WORD key)
+{
+    const HWND target = gTargetWindow.load();
+    if (!target || !IsWindow(target))
+    {
+        return;
+    }
+
+    std::lock_guard lock(gInputMutex);
+    ActivateTargetWindow(target);
+
+    std::array<INPUT, 4> inputs{};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = key;
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = key;
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_CONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+}
+
+bool ProcessCommandMessage(std::string_view message)
+{
+    if (message == "cmd,undo")
+    {
+        SendKeyboardShortcut('Z');
+        PostStatus(L"Undo");
+        return true;
+    }
+
+    if (message == "cmd,redo")
+    {
+        SendKeyboardShortcut('Y');
+        PostStatus(L"Redo");
+        return true;
+    }
+
+    return false;
+}
+
 void SendMouseButton(DWORD flags)
 {
     INPUT input{};
@@ -955,6 +1000,11 @@ void InjectTouchMouse(const InputEvent& event, POINT point, HWND target)
 
 void ProcessInputMessage(const std::string& message)
 {
+    if (ProcessCommandMessage(message))
+    {
+        return;
+    }
+
     InputEvent event;
     if (!ParseInputEvent(message, event))
     {

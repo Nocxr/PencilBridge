@@ -133,6 +133,27 @@ input[type=checkbox] { width: 20px; height: 20px; }
 }
 #cursor::before { width: 1px; height: 38px; left: 11px; top: -8px; }
 #cursor::after { width: 38px; height: 1px; top: 11px; left: -8px; }
+#gestureToast {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%) scale(.92);
+    padding: 12px 18px;
+    border: 1px solid rgba(255,255,255,.24);
+    border-radius: 10px;
+    background: rgba(10,12,16,.82);
+    color: #f4f5f7;
+    font-weight: 700;
+    letter-spacing: .08em;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 90ms ease, transform 90ms ease;
+    z-index: 5;
+}
+#gestureToast.show {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+}
 #pressure {
     position: absolute;
     left: 14px;
@@ -183,6 +204,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
 <main id="pad" aria-label="Pencil input surface">
     <div id="cursor"></div>
+    <div id="gestureToast"></div>
     <div id="pressure">Touch with Apple Pencil to begin</div>
 </main>
 
@@ -205,6 +227,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var positionText = document.getElementById('position');
     var cursor = document.getElementById('cursor');
     var pressureText = document.getElementById('pressure');
+    var gestureToast = document.getElementById('gestureToast');
 
     var socket = null;
     var reconnectTimer = null;
@@ -217,6 +240,20 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var latestTelemetry = null;
     var lastInputTime = 0;
     var strokeMaxGapMs = 0;
+
+    var touchGesture = new Map();
+    var touchGestureStart = 0;
+    var touchGestureMaxCount = 0;
+    var touchGestureMoved = false;
+    var touchGestureCancelled = false;
+    var pendingFingerDown = null;
+    var pendingFingerTimer = null;
+    var activeFingerSample = null;
+    var toastTimer = null;
+
+    var GESTURE_MAX_MS = 420;
+    var GESTURE_MOVE_PX = 28;
+    var FINGER_MOUSE_DELAY_MS = 120;
 
     function loadNumber(key, fallback) {
         var value = Number(localStorage.getItem(key));
@@ -258,6 +295,17 @@ input[type=checkbox] { width: 20px; height: 20px; }
     });
 
     refreshPressureControls();
+
+    fingerMouse.addEventListener('change', function () {
+        if (!fingerMouse.checked) {
+            clearPendingFingerTimer();
+            pendingFingerDown = null;
+            if (activeTouchId !== null && activeFingerSample) {
+                sendEvent(activeFingerSample, 'c');
+                activeFingerSample = null;
+            }
+        }
+    });
 
     function setConnection(isLive, text) {
         dot.classList.toggle('live', isLive);
@@ -342,6 +390,132 @@ input[type=checkbox] { width: 20px; height: 20px; }
             type + '  raw ' + rawPressure.toFixed(3) +
             '  out ' + outputPressure.toFixed(3) +
             '  peak ' + peakPressure.toFixed(3);
+    }
+
+    function snapshotPointer(event) {
+        return {
+            pointerType: event.pointerType || 'unknown',
+            pointerId: event.pointerId || 0,
+            clientX: event.clientX,
+            clientY: event.clientY,
+            pressure: Number(event.pressure || 0),
+            tiltX: Number(event.tiltX || 0),
+            tiltY: Number(event.tiltY || 0)
+        };
+    }
+
+    function showGestureToast(text) {
+        gestureToast.textContent = text;
+        gestureToast.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () {
+            gestureToast.classList.remove('show');
+        }, 420);
+    }
+
+    function sendCommand(command) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        socket.send('cmd,' + command);
+        showGestureToast(command === 'undo' ? 'UNDO' : 'REDO');
+    }
+
+    function clearPendingFingerTimer() {
+        if (pendingFingerTimer !== null) {
+            clearTimeout(pendingFingerTimer);
+            pendingFingerTimer = null;
+        }
+    }
+
+    function commitPendingFingerDown() {
+        clearPendingFingerTimer();
+        if (!pendingFingerDown || !fingerMouse.checked || touchGestureMaxCount >= 2) {
+            pendingFingerDown = null;
+            return;
+        }
+
+        activeFingerSample = pendingFingerDown;
+        sendEvent(pendingFingerDown, 'd');
+        pendingFingerDown = null;
+    }
+
+    function beginTouchGesture(event) {
+        if (touchGesture.size === 0) {
+            touchGestureStart = performance.now();
+            touchGestureMaxCount = 0;
+            touchGestureMoved = false;
+            touchGestureCancelled = false;
+        }
+
+        touchGesture.set(event.pointerId, {
+            startX: event.clientX,
+            startY: event.clientY,
+            lastX: event.clientX,
+            lastY: event.clientY
+        });
+
+        touchGestureMaxCount = Math.max(touchGestureMaxCount, touchGesture.size);
+
+        if (touchGestureMaxCount >= 2) {
+            clearPendingFingerTimer();
+            pendingFingerDown = null;
+
+            if (activeTouchId !== null && activeFingerSample) {
+                sendEvent(activeFingerSample, 'c');
+                activeFingerSample = null;
+            }
+        }
+    }
+
+    function moveTouchGesture(event) {
+        var touch = touchGesture.get(event.pointerId);
+        if (!touch) {
+            return;
+        }
+
+        touch.lastX = event.clientX;
+        touch.lastY = event.clientY;
+        var dx = event.clientX - touch.startX;
+        var dy = event.clientY - touch.startY;
+        if ((dx * dx + dy * dy) > GESTURE_MOVE_PX * GESTURE_MOVE_PX) {
+            touchGestureMoved = true;
+        }
+    }
+
+    function finishTouchGesture(event, cancelled) {
+        if (!touchGesture.has(event.pointerId)) {
+            return false;
+        }
+
+        if (cancelled) {
+            touchGestureCancelled = true;
+        }
+
+        touchGesture.delete(event.pointerId);
+        var wasMultiTouch = touchGestureMaxCount >= 2;
+
+        if (touchGesture.size !== 0) {
+            return wasMultiTouch;
+        }
+
+        var duration = performance.now() - touchGestureStart;
+        var count = touchGestureMaxCount;
+        var recognized =
+            !touchGestureCancelled &&
+            !touchGestureMoved &&
+            duration <= GESTURE_MAX_MS &&
+            (count === 2 || count === 3);
+
+        if (recognized) {
+            sendCommand(count === 2 ? 'undo' : 'redo');
+        }
+
+        touchGestureStart = 0;
+        touchGestureMaxCount = 0;
+        touchGestureMoved = false;
+        touchGestureCancelled = false;
+        return wasMultiTouch || recognized;
     }
 
     function shouldForward(event) {
@@ -436,33 +610,116 @@ input[type=checkbox] { width: 20px; height: 20px; }
     }
 
     pad.addEventListener('pointerdown', function (event) {
+        if (event.pointerType === 'touch') {
+            event.preventDefault();
+            beginTouchGesture(event);
+            try { pad.setPointerCapture(event.pointerId); } catch (_) {}
+
+            if (touchGestureMaxCount >= 2) {
+                return;
+            }
+
+            if (fingerMouse.checked) {
+                pendingFingerDown = snapshotPointer(event);
+                clearPendingFingerTimer();
+                pendingFingerTimer = setTimeout(
+                    commitPendingFingerDown,
+                    FINGER_MOUSE_DELAY_MS);
+            }
+            return;
+        }
+
         if (!shouldForward(event)) {
             return;
         }
+
         event.preventDefault();
         try { pad.setPointerCapture(event.pointerId); } catch (_) {}
         sendEvent(event, 'd');
     }, { passive: false });
 
     pad.addEventListener('pointermove', function (event) {
+        if (event.pointerType === 'touch') {
+            event.preventDefault();
+            moveTouchGesture(event);
+
+            if (touchGestureMaxCount >= 2) {
+                return;
+            }
+
+            if (fingerMouse.checked) {
+                var sample = snapshotPointer(event);
+                if (pendingFingerDown) {
+                    var dx = sample.clientX - pendingFingerDown.clientX;
+                    var dy = sample.clientY - pendingFingerDown.clientY;
+                    if ((dx * dx + dy * dy) > 16) {
+                        commitPendingFingerDown();
+                    }
+                }
+
+                if (activeTouchId !== null) {
+                    activeFingerSample = sample;
+                    sendEvent(sample, 'm');
+                }
+            }
+            return;
+        }
+
         if (!shouldForward(event)) {
             return;
         }
-        event.preventDefault();
 
+        event.preventDefault();
         sendEvent(event, 'm');
     }, { passive: false });
 
     pad.addEventListener('pointerup', function (event) {
+        if (event.pointerType === 'touch') {
+            event.preventDefault();
+            var multiTouch = finishTouchGesture(event, false);
+
+            if (!multiTouch && fingerMouse.checked) {
+                if (pendingFingerDown) {
+                    commitPendingFingerDown();
+                }
+
+                if (activeTouchId !== null) {
+                    var sample = snapshotPointer(event);
+                    sendEvent(sample, 'u');
+                    activeFingerSample = null;
+                }
+            } else {
+                clearPendingFingerTimer();
+                pendingFingerDown = null;
+            }
+
+            try { pad.releasePointerCapture(event.pointerId); } catch (_) {}
+            return;
+        }
+
         if (!shouldForward(event)) {
             return;
         }
+
         event.preventDefault();
         sendEvent(event, 'u');
         try { pad.releasePointerCapture(event.pointerId); } catch (_) {}
     }, { passive: false });
 
     pad.addEventListener('pointercancel', function (event) {
+        if (event.pointerType === 'touch') {
+            event.preventDefault();
+            finishTouchGesture(event, true);
+            clearPendingFingerTimer();
+            pendingFingerDown = null;
+
+            if (activeTouchId !== null && activeFingerSample) {
+                sendEvent(activeFingerSample, 'c');
+                activeFingerSample = null;
+            }
+            return;
+        }
+
         if (!shouldForward(event)) {
             return;
         }
