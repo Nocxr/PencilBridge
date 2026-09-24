@@ -19,7 +19,16 @@ inline constexpr std::string_view kWebUi = R"PBHTML(
     color: #f4f5f7;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #111318; }
+html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #111318;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+}
 body { display: flex; flex-direction: column; overscroll-behavior: none; }
 header {
     flex: 0 0 auto;
@@ -136,6 +145,9 @@ input[type=checkbox] { width: 20px; height: 20px; }
 #markupView {
     display: none;
     flex: 1 1 auto;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
     min-height: 0;
     flex-direction: column;
     background: #0d0f13;
@@ -181,6 +193,10 @@ input[type=checkbox] { width: 20px; height: 20px; }
     background: #fff;
     box-shadow: 0 8px 28px rgba(0,0,0,.38);
     touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-user-drag: none;
 }
 #gestureToast {
     position: fixed;
@@ -539,16 +555,47 @@ input[type=checkbox] { width: 20px; height: 20px; }
     }, { passive: false });
 
     function endMarkupStroke(event) {
-        if (!markupDrawing || event.pointerType !== 'pen') {
+        if (event.pointerType !== 'pen') {
             return;
         }
         event.preventDefault();
-        markupDrawing = false;
+        if (markupDrawing) {
+            markupDrawing = false;
+        }
         try { markupCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
     }
 
     markupCanvas.addEventListener('pointerup', endMarkupStroke, { passive: false });
     markupCanvas.addEventListener('pointercancel', endMarkupStroke, { passive: false });
+
+    ['click', 'dblclick', 'contextmenu', 'dragstart', 'selectstart'].forEach(function (type) {
+        markupCanvas.addEventListener(type, function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (window.getSelection) {
+                var selection = window.getSelection();
+                if (selection) {
+                    selection.removeAllRanges();
+                }
+            }
+        }, { passive: false });
+    });
+
+    ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (type) {
+        markupCanvas.addEventListener(type, function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }, { passive: false });
+    });
+
+    document.addEventListener('selectionchange', function () {
+        if (markupView.style.display !== 'none' && window.getSelection) {
+            var selection = window.getSelection();
+            if (selection && selection.rangeCount > 0) {
+                selection.removeAllRanges();
+            }
+        }
+    });
 
     markupClear.addEventListener('click', function () {
         redrawMarkupBase();
@@ -976,6 +1023,18 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
     pad.addEventListener('contextmenu', function (event) {
         event.preventDefault();
+    });
+
+    ['click', 'dblclick', 'dragstart', 'selectstart'].forEach(function (type) {
+        pad.addEventListener(type, function (event) {
+            event.preventDefault();
+        }, { passive: false });
+    });
+
+    ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (type) {
+        pad.addEventListener(type, function (event) {
+            event.preventDefault();
+        }, { passive: false });
     });
 
     function telemetryFrame() {
