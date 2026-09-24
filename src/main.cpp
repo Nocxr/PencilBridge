@@ -1766,6 +1766,30 @@ void ClearGestureTouches()
     }
 }
 
+void FillTouchInfo(
+    POINTER_TOUCH_INFO& info,
+    const GestureTouchState& touch,
+    POINTER_FLAGS flags)
+{
+    ZeroMemory(&info, sizeof(info));
+    info.pointerInfo.pointerType = PT_TOUCH;
+    info.pointerInfo.pointerId =
+        static_cast<UINT32>(std::max(1, touch.id + 1));
+    info.pointerInfo.pointerFlags = flags;
+    info.pointerInfo.ptPixelLocation = touch.point;
+    info.touchFlags = TOUCH_FLAG_NONE;
+    info.touchMask = static_cast<TOUCH_MASK>(
+        TOUCH_MASK_CONTACTAREA |
+        TOUCH_MASK_ORIENTATION |
+        TOUCH_MASK_PRESSURE);
+    info.rcContact.left = touch.point.x - 2;
+    info.rcContact.top = touch.point.y - 2;
+    info.rcContact.right = touch.point.x + 2;
+    info.rcContact.bottom = touch.point.y + 2;
+    info.orientation = 90;
+    info.pressure = 512;
+}
+
 void ReleaseGestureTouches()
 {
     if (!gTouchInjectionReady)
@@ -1796,30 +1820,6 @@ void ReleaseGestureTouches()
     }
 
     ClearGestureTouches();
-}
-
-void FillTouchInfo(
-    POINTER_TOUCH_INFO& info,
-    const GestureTouchState& touch,
-    POINTER_FLAGS flags)
-{
-    ZeroMemory(&info, sizeof(info));
-    info.pointerInfo.pointerType = PT_TOUCH;
-    info.pointerInfo.pointerId =
-        static_cast<UINT32>(std::max(1, touch.id + 1));
-    info.pointerInfo.pointerFlags = flags;
-    info.pointerInfo.ptPixelLocation = touch.point;
-    info.touchFlags = TOUCH_FLAG_NONE;
-    info.touchMask = static_cast<TOUCH_MASK>(
-        TOUCH_MASK_CONTACTAREA |
-        TOUCH_MASK_ORIENTATION |
-        TOUCH_MASK_PRESSURE);
-    info.rcContact.left = touch.point.x - 2;
-    info.rcContact.top = touch.point.y - 2;
-    info.rcContact.right = touch.point.x + 2;
-    info.rcContact.bottom = touch.point.y + 2;
-    info.orientation = 90;
-    info.pressure = 512;
 }
 
 void InjectGestureTouch(const InputEvent& event, POINT point, HWND target)
