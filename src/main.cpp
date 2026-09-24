@@ -3336,7 +3336,10 @@ void HandleBootstrapClient(
             "<p>This is a one-time setup for this PencilBridge CA.</p>"
             "<ol>"
             "<li><a href=\"/PencilBridge-CA.mobileconfig\">"
-            "Download PencilBridge CA profile</a></li>"
+            "Download PencilBridge CA profile</a>"
+            "<small>If Safari does not offer the profile, "
+            "<a href=\"/PencilBridge-CA.cer\">download the raw CA certificate</a>.</small>"
+            "</li>"
             "<li>Open <b>Settings → General → "
             "VPN &amp; Device Management</b>, select "
             "<b>PencilBridge Local HTTPS</b>, and install it.</li>"
@@ -3476,6 +3479,7 @@ void ServerMain()
     if (listenSocket == INVALID_SOCKET)
     {
         PostStatus(L"Could not create listening socket.");
+        ShutdownTlsCredentials();
         WSACleanup();
         return;
     }
@@ -4649,13 +4653,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         gUrlText = CreateWindowExW(
             0, L"STATIC", L"Starting server...",
             WS_CHILD | WS_VISIBLE,
-            20, 188, 650, 24,
+            20, 188, 650, 38,
             hwnd, nullptr, nullptr, nullptr);
 
         gStatusText = CreateWindowExW(
             0, L"STATIC", L"Starting...",
             WS_CHILD | WS_VISIBLE,
-            20, 228, 650, 44,
+            20, 236, 650, 44,
             hwnd, nullptr, nullptr, nullptr);
 
         ApplyDefaultFont(label);
@@ -4814,8 +4818,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         HWND refresh = GetDlgItem(hwnd, ID_REFRESH_BUTTON);
         MoveWindow(refresh, std::max(20, width - 120), 44, 100, 28, TRUE);
         MoveWindow(gZoneText, 355, 87, std::max(100, width - 375), 20, TRUE);
-        MoveWindow(gUrlText, 20, 188, std::max(100, width - 40), 24, TRUE);
-        MoveWindow(gStatusText, 20, 228, std::max(100, width - 40), 44, TRUE);
+        MoveWindow(gUrlText, 20, 188, std::max(100, width - 40), 38, TRUE);
+        MoveWindow(gStatusText, 20, 236, std::max(100, width - 40), 44, TRUE);
         return 0;
     }
 
