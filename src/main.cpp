@@ -1459,22 +1459,32 @@ void CompleteZoneSelection(HWND hwnd)
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
 
-    const int left = static_cast<int>(std::clamp<LONG>(
+    const auto ClampCoordinate = [](LONG value, int maximum) -> int
+    {
+        const int coordinate = static_cast<int>(value);
+        if (coordinate < 0)
+        {
+            return 0;
+        }
+        if (coordinate > maximum)
+        {
+            return maximum;
+        }
+        return coordinate;
+    };
+
+    const int left = ClampCoordinate(
         std::min(gZoneDragStart.x, gZoneDragCurrent.x),
-        0L,
-        static_cast<LONG>(width)));
-    const int right = static_cast<int>(std::clamp<LONG>(
+        width);
+    const int right = ClampCoordinate(
         std::max(gZoneDragStart.x, gZoneDragCurrent.x),
-        0L,
-        static_cast<LONG>(width)));
-    const int top = static_cast<int>(std::clamp<LONG>(
+        width);
+    const int top = ClampCoordinate(
         std::min(gZoneDragStart.y, gZoneDragCurrent.y),
-        0L,
-        static_cast<LONG>(height)));
-    const int bottom = static_cast<int>(std::clamp<LONG>(
+        height);
+    const int bottom = ClampCoordinate(
         std::max(gZoneDragStart.y, gZoneDragCurrent.y),
-        0L,
-        static_cast<LONG>(height)));
+        height);
 
     if (right - left < 12 || bottom - top < 12 || width <= 0 || height <= 0)
     {
