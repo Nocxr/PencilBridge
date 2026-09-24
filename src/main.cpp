@@ -130,6 +130,16 @@ std::atomic<int> gVirtualDesktopHeight{1};
 
 bool gTouchDown = false;
 int gActiveTouchPointer = -1;
+bool gTouchInjectionReady = false;
+
+struct GestureTouchState
+{
+    int id = -1;
+    POINT point{};
+    bool active = false;
+};
+
+std::array<GestureTouchState, 4> gGestureTouches{};
 
 void ApplyDefaultFont(HWND hwnd)
 {
@@ -1598,6 +1608,150 @@ void InjectTouchMouse(const InputEvent& event, POINT point, HWND target)
     }
 }
 
+GestureTouchState* FindGestureTouch(int id)
+{
+    for (GestureTouchState& touch : gGestureTouches)
+    {
+        if (touch.active && touch.id == id)
+        {
+            return &touch;
+        }
+    }
+    return nullptr;
+}
+
+GestureTouchState* AllocateGestureTouch(int id)
+{
+    if (GestureTouchState* existing = FindGestureTouch(id))
+    {
+        return existing;
+    }
+
+    for (GestureTouchState& touch : gGestureTouches)
+    {
+        if (!touch.active)
+        {
+            touch.id = id;
+            touch.active = true;
+            return &touch;
+        }
+    }
+    return nullptr;
+}
+
+void ClearGestureTouches()
+{
+    for (GestureTouchState& touch : gGestureTouches)
+    {
+        touch = {};
+        touch.id = -1;
+    }
+}
+
+void FillTouchInfo(
+    POINTER_TOUCH_INFO& info,
+    const GestureTouchState& touch,
+    POINTER_FLAGS flags)
+{
+    ZeroMemory(&info, sizeof(info));
+    info.pointerInfo.pointerType = PT_TOUCH;
+    info.pointerInfo.pointerId =
+        static_cast<UINT32>(std::max(1, touch.id + 1));
+    info.pointerInfo.pointerFlags = flags;
+    info.pointerInfo.ptPixelLocation = touch.point;
+    info.touchFlags = TOUCH_FLAG_NONE;
+    info.touchMask = static_cast<TOUCH_MASK>(
+        TOUCH_MASK_CONTACTAREA |
+        TOUCH_MASK_ORIENTATION |
+        TOUCH_MASK_PRESSURE);
+    info.rcContact.left = touch.point.x - 2;
+    info.rcContact.top = touch.point.y - 2;
+    info.rcContact.right = touch.point.x + 2;
+    info.rcContact.bottom = touch.point.y + 2;
+    info.orientation = 90;
+    info.pressure = 512;
+}
+
+void InjectGestureTouch(const InputEvent& event, POINT point, HWND target)
+{
+    if (!gTouchInjectionReady)
+    {
+        return;
+    }
+
+    std::lock_guard lock(gInputMutex);
+
+    if (event.phase == 'd' &&
+        !gScreenRectActive.load(std::memory_order_relaxed))
+    {
+        ActivateTargetWindow(target);
+    }
+
+    GestureTouchState* changed = nullptr;
+    if (event.phase == 'd')
+    {
+        changed = AllocateGestureTouch(event.pointerId);
+        if (!changed)
+        {
+            return;
+        }
+        changed->point = point;
+    }
+    else
+    {
+        changed = FindGestureTouch(event.pointerId);
+        if (!changed)
+        {
+            return;
+        }
+        changed->point = point;
+    }
+
+    std::array<POINTER_TOUCH_INFO, 4> infos{};
+    UINT32 count = 0;
+
+    for (const GestureTouchState& touch : gGestureTouches)
+    {
+        if (!touch.active)
+        {
+            continue;
+        }
+
+        POINTER_FLAGS flags =
+            POINTER_FLAG_UPDATE |
+            POINTER_FLAG_INRANGE |
+            POINTER_FLAG_INCONTACT;
+
+        if (touch.id == event.pointerId)
+        {
+            if (event.phase == 'd')
+            {
+                flags =
+                    POINTER_FLAG_DOWN |
+                    POINTER_FLAG_INRANGE |
+                    POINTER_FLAG_INCONTACT;
+            }
+            else if (event.phase == 'u' || event.phase == 'c')
+            {
+                flags = POINTER_FLAG_UP;
+            }
+        }
+
+        FillTouchInfo(infos[count++], touch, flags);
+    }
+
+    if (count > 0)
+    {
+        InjectTouchInput(count, infos.data());
+    }
+
+    if (event.phase == 'u' || event.phase == 'c')
+    {
+        changed->active = false;
+        changed->id = -1;
+    }
+}
+
 void ProcessInputMessage(const std::string& message)
 {
     if (ProcessCommandMessage(message))
@@ -1630,6 +1784,14 @@ void ProcessInputMessage(const std::string& message)
         }
         InjectTouchMouse(event, point, target);
     }
+    else if (event.device == 'g')
+    {
+        if (!MapToTarget(event.x, event.y, point, target))
+        {
+            return;
+        }
+        InjectGestureTouch(event, point, target);
+    }
 }
 
 void ReleaseActiveInputState()
@@ -1642,6 +1804,8 @@ void ReleaseActiveInputState()
         gTouchDown = false;
         gActiveTouchPointer = -1;
     }
+
+    ClearGestureTouches();
 
     if (gPenDown && gPenDevice)
     {
@@ -2841,6 +3005,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     RefreshVirtualDesktopGeometry();
 
     gPenDevice = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE);
+    gTouchInjectionReady =
+        InitializeTouchInjection(10, TOUCH_FEEDBACK_NONE) != FALSE;
 
     const wchar_t kClassName[] = L"PencilBridgeWindow";
 

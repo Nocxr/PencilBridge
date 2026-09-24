@@ -311,6 +311,9 @@ body.markup-active .metrics {
     <div class="spacer"></div>
     <label class="toggle"><input id="fingerDraw" type="checkbox"> Finger draw</label>
     <label class="toggle"><input id="fingerMouse" type="checkbox"> Finger mouse</label>
+    <label class="toggle"><input id="pinchZoom" type="checkbox"> Pinch zoom</label>
+    <label class="toggle"><input id="rotateGesture" type="checkbox"> Rotate</label>
+    <label class="toggle"><input id="keepAwake" type="checkbox"> Keep awake</label>
 </header>
 
 <div class="pressure-controls">
@@ -366,6 +369,9 @@ body.markup-active .metrics {
     var statusText = document.getElementById('statusText');
     var fingerDraw = document.getElementById('fingerDraw');
     var fingerMouse = document.getElementById('fingerMouse');
+    var pinchZoom = document.getElementById('pinchZoom');
+    var rotateGesture = document.getElementById('rotateGesture');
+    var keepAwake = document.getElementById('keepAwake');
     var deviceText = document.getElementById('device');
     var pressureMetric = document.getElementById('pressureMetric');
     var pressureMax = document.getElementById('pressureMax');
@@ -406,6 +412,7 @@ body.markup-active .metrics {
     var touchGestureMaxCount = 0;
     var touchGestureMoved = false;
     var touchGestureCancelled = false;
+    var nativeGestureActive = false;
     var pendingFingerDown = null;
     var pendingFingerMode = null;
     var pendingFingerTimer = null;
@@ -413,6 +420,7 @@ body.markup-active .metrics {
     var activeFingerMode = null;
     var nativePadStylusId = null;
     var toastTimer = null;
+    var wakeLock = null;
 
     var GESTURE_MAX_MS = 420;
     var GESTURE_MOVE_PX = 28;
@@ -494,6 +502,88 @@ body.markup-active .metrics {
             fingerMouse.checked = false;
         }
         cancelActiveFinger();
+    });
+
+    pinchZoom.checked =
+        localStorage.getItem('pencilbridge.pinchZoom') !== '0';
+    rotateGesture.checked =
+        localStorage.getItem('pencilbridge.rotateGesture') === '1';
+    keepAwake.checked =
+        localStorage.getItem('pencilbridge.keepAwake') === '1';
+
+    pinchZoom.addEventListener('change', function () {
+        localStorage.setItem(
+            'pencilbridge.pinchZoom',
+            pinchZoom.checked ? '1' : '0');
+        endNativeGestureInjection();
+    });
+
+    rotateGesture.addEventListener('change', function () {
+        localStorage.setItem(
+            'pencilbridge.rotateGesture',
+            rotateGesture.checked ? '1' : '0');
+        endNativeGestureInjection();
+    });
+
+    async function acquireWakeLock() {
+        if (!keepAwake.checked ||
+            document.visibilityState !== 'visible') {
+            return;
+        }
+
+        if (!('wakeLock' in navigator) ||
+            !navigator.wakeLock ||
+            typeof navigator.wakeLock.request !== 'function') {
+            keepAwake.checked = false;
+            localStorage.setItem('pencilbridge.keepAwake', '0');
+            showGestureToast('WAKE LOCK UNSUPPORTED');
+            return;
+        }
+
+        try {
+            if (!wakeLock) {
+                wakeLock = await navigator.wakeLock.request('screen');
+                wakeLock.addEventListener('release', function () {
+                    wakeLock = null;
+                });
+            }
+        } catch (_) {
+            showGestureToast('WAKE LOCK FAILED');
+        }
+    }
+
+    async function releaseWakeLock() {
+        if (!wakeLock) {
+            return;
+        }
+
+        var current = wakeLock;
+        wakeLock = null;
+        try {
+            await current.release();
+        } catch (_) {}
+    }
+
+    keepAwake.addEventListener('change', function () {
+        localStorage.setItem(
+            'pencilbridge.keepAwake',
+            keepAwake.checked ? '1' : '0');
+
+        if (keepAwake.checked) {
+            acquireWakeLock();
+        } else {
+            releaseWakeLock();
+        }
+    });
+
+    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') {
+            if (keepAwake.checked) {
+                acquireWakeLock();
+            }
+        } else {
+            wakeLock = null;
+        }
     });
 
     function refreshPressureControls() {
@@ -1293,8 +1383,201 @@ body.markup-active .metrics {
         pendingFingerMode = null;
     }
 
+    function sendGestureTouch(sample, phase) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+
+        var point = normalized(sample);
+        socket.send([
+            'g',
+            phase,
+            point.x.toFixed(6),
+            point.y.toFixed(6),
+            '0.500000',
+            '0',
+            '0',
+            String(sample.pointerId || 0)
+        ].join(','));
+    }
+
+    function twoFingerEntries() {
+        if (touchGesture.size !== 2) {
+            return null;
+        }
+
+        var entries = Array.from(touchGesture.entries());
+        return [
+            {
+                id: entries[0][0],
+                startX: entries[0][1].startX,
+                startY: entries[0][1].startY,
+                x: entries[0][1].lastX,
+                y: entries[0][1].lastY
+            },
+            {
+                id: entries[1][0],
+                startX: entries[1][1].startX,
+                startY: entries[1][1].startY,
+                x: entries[1][1].lastX,
+                y: entries[1][1].lastY
+            }
+        ];
+    }
+
+    function angleDelta(a, b) {
+        var delta = a - b;
+        while (delta > Math.PI) delta -= Math.PI * 2;
+        while (delta < -Math.PI) delta += Math.PI * 2;
+        return delta;
+    }
+
+    function transformedGesturePoints(useStart) {
+        var fingers = twoFingerEntries();
+        if (!fingers) {
+            return null;
+        }
+
+        var startCenterX =
+            (fingers[0].startX + fingers[1].startX) * 0.5;
+        var startCenterY =
+            (fingers[0].startY + fingers[1].startY) * 0.5;
+
+        var startDx =
+            fingers[1].startX - fingers[0].startX;
+        var startDy =
+            fingers[1].startY - fingers[0].startY;
+        var currentDx =
+            fingers[1].x - fingers[0].x;
+        var currentDy =
+            fingers[1].y - fingers[0].y;
+
+        var startDistance =
+            Math.max(1, Math.hypot(startDx, startDy));
+        var currentDistance =
+            Math.max(1, Math.hypot(currentDx, currentDy));
+        var startAngle = Math.atan2(startDy, startDx);
+        var currentAngle = Math.atan2(currentDy, currentDx);
+
+        var distance = useStart || !pinchZoom.checked
+            ? startDistance
+            : currentDistance;
+        var angle = useStart || !rotateGesture.checked
+            ? startAngle
+            : currentAngle;
+
+        var halfX = Math.cos(angle) * distance * 0.5;
+        var halfY = Math.sin(angle) * distance * 0.5;
+
+        return [
+            {
+                pointerType: 'touch',
+                pointerId: fingers[0].id,
+                clientX: startCenterX - halfX,
+                clientY: startCenterY - halfY,
+                pressure: 0.5,
+                tiltX: 0,
+                tiltY: 0
+            },
+            {
+                pointerType: 'touch',
+                pointerId: fingers[1].id,
+                clientX: startCenterX + halfX,
+                clientY: startCenterY + halfY,
+                pressure: 0.5,
+                tiltX: 0,
+                tiltY: 0
+            }
+        ];
+    }
+
+    function gestureMovedEnough() {
+        var fingers = twoFingerEntries();
+        if (!fingers) {
+            return false;
+        }
+
+        var startDx =
+            fingers[1].startX - fingers[0].startX;
+        var startDy =
+            fingers[1].startY - fingers[0].startY;
+        var currentDx =
+            fingers[1].x - fingers[0].x;
+        var currentDy =
+            fingers[1].y - fingers[0].y;
+
+        var startDistance = Math.hypot(startDx, startDy);
+        var currentDistance = Math.hypot(currentDx, currentDy);
+        var startAngle = Math.atan2(startDy, startDx);
+        var currentAngle = Math.atan2(currentDy, currentDx);
+
+        var pinchMoved =
+            pinchZoom.checked &&
+            Math.abs(currentDistance - startDistance) >= 7;
+        var rotateMoved =
+            rotateGesture.checked &&
+            Math.abs(angleDelta(currentAngle, startAngle)) >=
+                (4 * Math.PI / 180);
+
+        return pinchMoved || rotateMoved;
+    }
+
+    function updateNativeGestureInjection() {
+        if ((!pinchZoom.checked && !rotateGesture.checked) ||
+            touchGesture.size !== 2) {
+            return;
+        }
+
+        if (!nativeGestureActive) {
+            if (!gestureMovedEnough()) {
+                return;
+            }
+
+            clearPendingFingerTimer();
+            pendingFingerDown = null;
+            pendingFingerMode = null;
+
+            if (activeTouchId !== null && activeFingerSample) {
+                sendEvent(activeFingerSample, 'c');
+                activeFingerSample = null;
+                activeFingerMode = null;
+            }
+
+            var startPoints = transformedGesturePoints(true);
+            if (!startPoints) {
+                return;
+            }
+
+            nativeGestureActive = true;
+            touchGestureCancelled = true;
+            sendGestureTouch(startPoints[0], 'd');
+            sendGestureTouch(startPoints[1], 'd');
+        }
+
+        var currentPoints = transformedGesturePoints(false);
+        if (currentPoints) {
+            sendGestureTouch(currentPoints[0], 'm');
+            sendGestureTouch(currentPoints[1], 'm');
+        }
+    }
+
+    function endNativeGestureInjection() {
+        if (!nativeGestureActive) {
+            return;
+        }
+
+        var points = transformedGesturePoints(false);
+        if (points) {
+            sendGestureTouch(points[0], 'u');
+            sendGestureTouch(points[1], 'u');
+        }
+
+        nativeGestureActive = false;
+    }
+
     function beginTouchGesture(event) {
         if (touchGesture.size === 0) {
+            endNativeGestureInjection();
             touchGestureStart = performance.now();
             touchGestureMaxCount = 0;
             touchGestureMoved = false;
@@ -1309,6 +1592,11 @@ body.markup-active .metrics {
         });
 
         touchGestureMaxCount = Math.max(touchGestureMaxCount, touchGesture.size);
+
+        if (touchGesture.size > 2) {
+            endNativeGestureInjection();
+            touchGestureCancelled = true;
+        }
 
         if (touchGestureMaxCount >= 2) {
             clearPendingFingerTimer();
@@ -1336,6 +1624,8 @@ body.markup-active .metrics {
         if ((dx * dx + dy * dy) > GESTURE_MOVE_PX * GESTURE_MOVE_PX) {
             touchGestureMoved = true;
         }
+
+        updateNativeGestureInjection();
     }
 
     function finishTouchGesture(event, cancelled) {
@@ -1344,6 +1634,11 @@ body.markup-active .metrics {
         }
 
         if (cancelled) {
+            touchGestureCancelled = true;
+        }
+
+        if (nativeGestureActive) {
+            endNativeGestureInjection();
             touchGestureCancelled = true;
         }
 
@@ -1899,6 +2194,7 @@ body.markup-active .metrics {
         cancelActiveFinger();
         nativePadStylusId = null;
         penActive = false;
+        releaseWakeLock();
         if (socket) {
             socket.close();
         }
