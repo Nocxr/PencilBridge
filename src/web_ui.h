@@ -411,6 +411,7 @@ body.markup-active .metrics {
     var pendingFingerTimer = null;
     var activeFingerSample = null;
     var activeFingerMode = null;
+    var nativePadStylusId = null;
     var toastTimer = null;
 
     var GESTURE_MAX_MS = 420;
@@ -458,6 +459,12 @@ body.markup-active .metrics {
 
     markupInputMode.textContent =
         useNativeIosTouchInk ? 'iOS native ink' : 'pointer ink';
+
+    if (useNativeIosTouchInk) {
+        pressureText.textContent = isLikelyPhone()
+            ? 'iOS native touch input'
+            : 'iOS native Pencil input';
+    }
 
     var savedFingerDraw = localStorage.getItem('pencilbridge.markupFingerDraw');
     markupFingerDraw.checked =
@@ -1165,6 +1172,49 @@ body.markup-active .metrics {
             '  peak ' + peakPressure.toFixed(3);
     }
 
+    function touchTilt(touch) {
+        var altitude = Number(touch.altitudeAngle);
+        var azimuth = Number(touch.azimuthAngle);
+
+        if (!Number.isFinite(altitude) ||
+            !Number.isFinite(azimuth) ||
+            altitude <= 0) {
+            return { x: 0, y: 0 };
+        }
+
+        var tanAltitude = Math.tan(altitude);
+        if (Math.abs(tanAltitude) < 0.0001) {
+            tanAltitude = 0.0001;
+        }
+
+        return {
+            x: Math.max(-90, Math.min(
+                90,
+                Math.atan(Math.cos(azimuth) / tanAltitude) * 180 / Math.PI)),
+            y: Math.max(-90, Math.min(
+                90,
+                Math.atan(Math.sin(azimuth) / tanAltitude) * 180 / Math.PI))
+        };
+    }
+
+    function nativeTouchSample(touch, pointerType) {
+        var tilt = pointerType === 'pen'
+            ? touchTilt(touch)
+            : { x: 0, y: 0 };
+
+        return {
+            pointerType: pointerType,
+            pointerId: touch.identifier,
+            clientX: touch.clientX,
+            clientY: touch.clientY,
+            pressure: pointerType === 'pen'
+                ? Math.max(0, Math.min(1, Number(touch.force || 0)))
+                : 0.5,
+            tiltX: tilt.x,
+            tiltY: tilt.y
+        };
+    }
+
     function snapshotPointer(event) {
         return {
             pointerType: event.pointerType || 'unknown',
@@ -1421,6 +1471,10 @@ body.markup-active .metrics {
     }
 
     pad.addEventListener('pointerdown', function (event) {
+        if (useNativeIosTouchInk) {
+            return;
+        }
+
         if (event.pointerType === 'touch') {
             var mode = requestedFingerMode();
             if (!mode) {
@@ -1460,6 +1514,10 @@ body.markup-active .metrics {
     }, { passive: false });
 
     pad.addEventListener('pointermove', function (event) {
+        if (useNativeIosTouchInk) {
+            return;
+        }
+
         if (event.pointerType === 'touch') {
             event.preventDefault();
             moveTouchGesture(event);
@@ -1495,7 +1553,7 @@ body.markup-active .metrics {
     }, { passive: false });
 
     window.addEventListener('pointerup', function (event) {
-        if (markupDrawing) {
+        if (useNativeIosTouchInk || markupDrawing) {
             return;
         }
 
@@ -1535,7 +1593,7 @@ body.markup-active .metrics {
     }, { capture: true, passive: false });
 
     window.addEventListener('pointercancel', function (event) {
-        if (markupDrawing) {
+        if (useNativeIosTouchInk || markupDrawing) {
             return;
         }
 
@@ -1566,6 +1624,234 @@ body.markup-active .metrics {
             penActive = false;
         }
     }, { capture: true, passive: false });
+
+    function beginNativePadStylus(touch) {
+        var sample = nativeTouchSample(touch, 'pen');
+
+        // A new physical stylus contact is authoritative. Explicitly close any
+        // stale browser/host stroke before beginning this one.
+        if (penActive) {
+            penCancels += 1;
+            sendEvent(sample, 'c');
+        }
+
+        nativePadStylusId = touch.identifier;
+        sendEvent(sample, 'd');
+    }
+
+    function moveNativePadStylus(touch) {
+        if (nativePadStylusId !== touch.identifier) {
+            return;
+        }
+        sendEvent(nativeTouchSample(touch, 'pen'), 'm');
+    }
+
+    function endNativePadStylus(touch, cancelled) {
+        if (nativePadStylusId !== touch.identifier) {
+            return;
+        }
+
+        sendEvent(
+            nativeTouchSample(touch, 'pen'),
+            cancelled ? 'c' : 'u');
+        nativePadStylusId = null;
+    }
+
+    pad.addEventListener('touchstart', function (event) {
+        if (!useNativeIosTouchInk ||
+            markupView.style.display !== 'none') {
+            return;
+        }
+
+        var handled = false;
+
+        for (var i = 0; i < event.changedTouches.length; ++i) {
+            var touch = event.changedTouches[i];
+
+            if (touchKind(touch) === 'pen') {
+                event.preventDefault();
+                event.stopPropagation();
+                beginNativePadStylus(touch);
+                handled = true;
+                continue;
+            }
+
+            var sample = nativeTouchSample(touch, 'touch');
+            beginTouchGesture(sample);
+            handled = true;
+
+            var mode = requestedFingerMode();
+            if (mode &&
+                touchGestureMaxCount < 2 &&
+                pendingFingerDown === null &&
+                activeTouchId === null) {
+                pendingFingerDown = sample;
+                pendingFingerMode = mode;
+                clearPendingFingerTimer();
+                pendingFingerTimer = setTimeout(
+                    commitPendingFingerDown,
+                    FINGER_MOUSE_DELAY_MS);
+            }
+        }
+
+        if (handled) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    }, { passive: false });
+
+    pad.addEventListener('touchmove', function (event) {
+        if (!useNativeIosTouchInk ||
+            markupView.style.display !== 'none') {
+            return;
+        }
+
+        var handled = false;
+
+        for (var i = 0; i < event.changedTouches.length; ++i) {
+            var touch = event.changedTouches[i];
+
+            if (touchKind(touch) === 'pen') {
+                if (nativePadStylusId === touch.identifier) {
+                    moveNativePadStylus(touch);
+                    handled = true;
+                }
+                continue;
+            }
+
+            var sample = nativeTouchSample(touch, 'touch');
+            if (touchGesture.has(sample.pointerId)) {
+                moveTouchGesture(sample);
+                handled = true;
+            }
+
+            if (pendingFingerDown &&
+                pendingFingerDown.pointerId === sample.pointerId) {
+                var dx = sample.clientX - pendingFingerDown.clientX;
+                var dy = sample.clientY - pendingFingerDown.clientY;
+                if ((dx * dx + dy * dy) > 16) {
+                    commitPendingFingerDown();
+                }
+            }
+
+            if (activeTouchId === sample.pointerId &&
+                activeFingerMode !== null) {
+                activeFingerSample = sample;
+                sendEvent(sample, 'm');
+                handled = true;
+            }
+        }
+
+        if (handled) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    }, { passive: false });
+
+    pad.addEventListener('touchend', function (event) {
+        if (!useNativeIosTouchInk ||
+            markupView.style.display !== 'none') {
+            return;
+        }
+
+        var handled = false;
+
+        for (var i = 0; i < event.changedTouches.length; ++i) {
+            var touch = event.changedTouches[i];
+
+            if (touchKind(touch) === 'pen') {
+                if (nativePadStylusId === touch.identifier) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    endNativePadStylus(touch, false);
+                    handled = true;
+                }
+                continue;
+            }
+
+            var sample = nativeTouchSample(touch, 'touch');
+            if (!touchGesture.has(sample.pointerId) &&
+                activeTouchId !== sample.pointerId) {
+                continue;
+            }
+
+            var multiTouch = finishTouchGesture(sample, false);
+
+            if (!multiTouch &&
+                (pendingFingerDown || activeTouchId === sample.pointerId)) {
+                if (pendingFingerDown &&
+                    pendingFingerDown.pointerId === sample.pointerId) {
+                    commitPendingFingerDown();
+                }
+
+                if (activeTouchId === sample.pointerId) {
+                    activeFingerSample = sample;
+                    sendEvent(sample, 'u');
+                    activeFingerSample = null;
+                    activeFingerMode = null;
+                }
+            } else {
+                clearPendingFingerTimer();
+                pendingFingerDown = null;
+                pendingFingerMode = null;
+            }
+
+            handled = true;
+        }
+
+        if (handled) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    }, { passive: false });
+
+    pad.addEventListener('touchcancel', function (event) {
+        if (!useNativeIosTouchInk ||
+            markupView.style.display !== 'none') {
+            return;
+        }
+
+        var handled = false;
+
+        for (var i = 0; i < event.changedTouches.length; ++i) {
+            var touch = event.changedTouches[i];
+
+            if (touchKind(touch) === 'pen') {
+                if (nativePadStylusId === touch.identifier) {
+                    endNativePadStylus(touch, true);
+                    handled = true;
+                }
+                continue;
+            }
+
+            var sample = nativeTouchSample(touch, 'touch');
+
+            if (touchGesture.has(sample.pointerId)) {
+                finishTouchGesture(sample, true);
+                handled = true;
+            }
+
+            if (pendingFingerDown &&
+                pendingFingerDown.pointerId === sample.pointerId) {
+                clearPendingFingerTimer();
+                pendingFingerDown = null;
+                pendingFingerMode = null;
+            }
+
+            if (activeTouchId === sample.pointerId) {
+                activeFingerSample = sample;
+                sendEvent(sample, 'c');
+                activeFingerSample = null;
+                activeFingerMode = null;
+                handled = true;
+            }
+        }
+
+        if (handled) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    }, { passive: false });
 
     pad.addEventListener('contextmenu', function (event) {
         event.preventDefault();
@@ -1609,6 +1895,7 @@ body.markup-active .metrics {
     window.addEventListener('pagehide', function () {
         resetMarkupStroke();
         cancelActiveFinger();
+        nativePadStylusId = null;
         penActive = false;
         if (socket) {
             socket.close();
