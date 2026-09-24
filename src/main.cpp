@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <windowsx.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
 
@@ -1442,12 +1443,12 @@ void UpdateZoneOutline()
     constexpr int margin = 4;
     SetWindowPos(
         gZoneOutlineWindow,
-        HWND_TOP,
+        nullptr,
         left - margin,
         top - margin,
         std::max(8, right - left + margin * 2),
         std::max(8, bottom - top + margin * 2),
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
     InvalidateRect(gZoneOutlineWindow, nullptr, FALSE);
 }
 
