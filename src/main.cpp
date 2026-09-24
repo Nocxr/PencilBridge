@@ -1491,14 +1491,25 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
 
 void SendKeyboardShortcut(WORD key)
 {
+    const bool screenRectMode =
+        gScreenRectActive.load(std::memory_order_relaxed);
     const HWND target = gTargetWindow.load();
-    if (!target || !IsWindow(target))
+
+    if (!screenRectMode &&
+        (!target || !IsWindow(target)))
     {
         return;
     }
 
     std::lock_guard lock(gInputMutex);
-    ActivateTargetWindow(target);
+
+    // Window/zone mode deliberately targets the selected app. Screen Rect mode
+    // is desktop-global, so leave focus alone and send the shortcut to whatever
+    // window the user currently has active.
+    if (!screenRectMode)
+    {
+        ActivateTargetWindow(target);
+    }
 
     std::array<INPUT, 4> inputs{};
     inputs[0].type = INPUT_KEYBOARD;
