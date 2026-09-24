@@ -4,6 +4,7 @@
 #include <windowsx.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,8 @@
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ws2_32.lib")
 
 namespace
@@ -35,6 +38,8 @@ constexpr int ID_TARGET_COMBO = 1001;
 constexpr int ID_REFRESH_BUTTON = 1002;
 constexpr int ID_SELECT_ZONE_BUTTON = 1003;
 constexpr int ID_CLEAR_ZONE_BUTTON = 1004;
+constexpr int ID_SEND_CLIPBOARD_BUTTON = 1005;
+constexpr int ID_AUTO_CLIPBOARD_CHECK = 1006;
 constexpr UINT_PTR ID_ZONE_TRACK_TIMER = 2001;
 constexpr int kPort = 8765;
 constexpr wchar_t kZoneSelectClassName[] = L"PencilBridgeZoneSelect";
@@ -51,6 +56,7 @@ HWND gTargetCombo = nullptr;
 HWND gUrlText = nullptr;
 HWND gStatusText = nullptr;
 HWND gZoneText = nullptr;
+HWND gAutoClipboardCheck = nullptr;
 HWND gZoneSelectWindow = nullptr;
 HWND gZoneOutlineWindow = nullptr;
 HWND gZoneOutlineOwner = nullptr;
@@ -72,7 +78,13 @@ std::atomic<HWND> gTargetWindow{nullptr};
 std::atomic<bool> gRunning{true};
 std::atomic<SOCKET> gListenSocket{INVALID_SOCKET};
 std::atomic<SOCKET> gClientSocket{INVALID_SOCKET};
+std::atomic<SOCKET> gWebSocketClient{INVALID_SOCKET};
+std::mutex gWebSocketSendMutex;
 std::thread gServerThread;
+
+IWICImagingFactory* gWicFactory = nullptr;
+std::atomic<bool> gAutoSendClipboard{true};
+std::atomic<bool> gIgnoreNextClipboardUpdate{false};
 
 HSYNTHETICPOINTERDEVICE gPenDevice = nullptr;
 std::mutex gInputMutex;
@@ -485,29 +497,445 @@ bool RecvExact(SOCKET socket, uint8_t* data, size_t size)
     return received == size;
 }
 
-bool SendWebSocketFrame(SOCKET socket, uint8_t opcode, const std::string& payload)
+bool SendWebSocketFrameBytes(
+    SOCKET socket,
+    uint8_t opcode,
+    const uint8_t* payload,
+    size_t payloadSize)
 {
-    std::vector<uint8_t> frame;
-    frame.reserve(payload.size() + 10);
-    frame.push_back(static_cast<uint8_t>(0x80 | (opcode & 0x0F)));
+    std::vector<uint8_t> header;
+    header.reserve(10);
+    header.push_back(static_cast<uint8_t>(0x80 | (opcode & 0x0F)));
 
-    if (payload.size() <= 125)
+    if (payloadSize <= 125)
     {
-        frame.push_back(static_cast<uint8_t>(payload.size()));
+        header.push_back(static_cast<uint8_t>(payloadSize));
     }
-    else if (payload.size() <= 65535)
+    else if (payloadSize <= 65535)
     {
-        frame.push_back(126);
-        frame.push_back(static_cast<uint8_t>((payload.size() >> 8) & 0xFF));
-        frame.push_back(static_cast<uint8_t>(payload.size() & 0xFF));
+        header.push_back(126);
+        header.push_back(static_cast<uint8_t>((payloadSize >> 8) & 0xFF));
+        header.push_back(static_cast<uint8_t>(payloadSize & 0xFF));
     }
     else
+    {
+        header.push_back(127);
+        const uint64_t length = static_cast<uint64_t>(payloadSize);
+        for (int shift = 56; shift >= 0; shift -= 8)
+        {
+            header.push_back(static_cast<uint8_t>((length >> shift) & 0xFF));
+        }
+    }
+
+    if (!SendAll(socket, reinterpret_cast<const char*>(header.data()), header.size()))
     {
         return false;
     }
 
-    frame.insert(frame.end(), payload.begin(), payload.end());
-    return SendAll(socket, reinterpret_cast<const char*>(frame.data()), frame.size());
+    return payloadSize == 0 ||
+           SendAll(socket, reinterpret_cast<const char*>(payload), payloadSize);
+}
+
+bool SendWebSocketFrame(SOCKET socket, uint8_t opcode, const std::string& payload)
+{
+    return SendWebSocketFrameBytes(
+        socket,
+        opcode,
+        reinterpret_cast<const uint8_t*>(payload.data()),
+        payload.size());
+}
+
+
+void ReleaseCom(IUnknown*& value)
+{
+    if (value)
+    {
+        value->Release();
+        value = nullptr;
+    }
+}
+
+bool EnsureWicFactory()
+{
+    if (gWicFactory)
+    {
+        return true;
+    }
+
+    return SUCCEEDED(CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&gWicFactory)));
+}
+
+HBITMAP CopyClipboardBitmap()
+{
+    if (!OpenClipboard(gMainWindow))
+    {
+        return nullptr;
+    }
+
+    HBITMAP result = nullptr;
+    if (IsClipboardFormatAvailable(CF_BITMAP))
+    {
+        HBITMAP source = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+        if (source)
+        {
+            result = static_cast<HBITMAP>(CopyImage(
+                source,
+                IMAGE_BITMAP,
+                0,
+                0,
+                LR_CREATEDIBSECTION));
+        }
+    }
+
+    CloseClipboard();
+    return result;
+}
+
+bool EncodeBitmapToPng(HBITMAP bitmap, std::vector<uint8_t>& png)
+{
+    png.clear();
+    if (!bitmap || !EnsureWicFactory())
+    {
+        return false;
+    }
+
+    IWICBitmap* source = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* properties = nullptr;
+    IStream* stream = nullptr;
+
+    HRESULT hr = gWicFactory->CreateBitmapFromHBITMAP(
+        bitmap,
+        nullptr,
+        WICBitmapIgnoreAlpha,
+        &source);
+
+    if (SUCCEEDED(hr))
+    {
+        hr = CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = gWicFactory->CreateEncoder(
+            GUID_ContainerFormatPng,
+            nullptr,
+            &encoder);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = encoder->CreateNewFrame(&frame, &properties);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = frame->Initialize(properties);
+    }
+
+    UINT width = 0;
+    UINT height = 0;
+    if (SUCCEEDED(hr))
+    {
+        hr = source->GetSize(&width, &height);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = frame->SetSize(width, height);
+    }
+    if (SUCCEEDED(hr))
+    {
+        WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+        hr = frame->SetPixelFormat(&format);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = frame->WriteSource(source, nullptr);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = frame->Commit();
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = encoder->Commit();
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        STATSTG stat{};
+        hr = stream->Stat(&stat, STATFLAG_NONAME);
+        if (SUCCEEDED(hr) && stat.cbSize.QuadPart > 0 &&
+            stat.cbSize.QuadPart <= static_cast<ULONGLONG>(32 * 1024 * 1024))
+        {
+            png.resize(static_cast<size_t>(stat.cbSize.QuadPart));
+            LARGE_INTEGER zero{};
+            stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+            ULONG read = 0;
+            hr = stream->Read(
+                png.data(),
+                static_cast<ULONG>(png.size()),
+                &read);
+            if (FAILED(hr) || read != png.size())
+            {
+                png.clear();
+                hr = E_FAIL;
+            }
+        }
+        else
+        {
+            hr = E_FAIL;
+        }
+    }
+
+    if (properties) properties->Release();
+    if (frame) frame->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    if (source) source->Release();
+
+    return SUCCEEDED(hr) && !png.empty();
+}
+
+bool CaptureClipboardPng(std::vector<uint8_t>& png)
+{
+    HBITMAP bitmap = CopyClipboardBitmap();
+    if (!bitmap)
+    {
+        return false;
+    }
+
+    const bool encoded = EncodeBitmapToPng(bitmap, png);
+    DeleteObject(bitmap);
+    return encoded;
+}
+
+bool DecodePngToDibV5(const uint8_t* png, size_t pngSize, HGLOBAL& dibOut)
+{
+    dibOut = nullptr;
+    if (!png || pngSize == 0 || pngSize > static_cast<size_t>(MAXDWORD) || !EnsureWicFactory())
+    {
+        return false;
+    }
+
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+
+    HRESULT hr = gWicFactory->CreateStream(&stream);
+    if (SUCCEEDED(hr))
+    {
+        hr = stream->InitializeFromMemory(
+            const_cast<BYTE*>(reinterpret_cast<const BYTE*>(png)),
+            static_cast<DWORD>(pngSize));
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = gWicFactory->CreateDecoderFromStream(
+            stream,
+            nullptr,
+            WICDecodeMetadataCacheOnLoad,
+            &decoder);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = decoder->GetFrame(0, &frame);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = gWicFactory->CreateFormatConverter(&converter);
+    }
+    if (SUCCEEDED(hr))
+    {
+        hr = converter->Initialize(
+            frame,
+            GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0,
+            WICBitmapPaletteTypeCustom);
+    }
+
+    UINT width = 0;
+    UINT height = 0;
+    if (SUCCEEDED(hr))
+    {
+        hr = converter->GetSize(&width, &height);
+    }
+
+    const size_t stride = static_cast<size_t>(width) * 4;
+    const size_t pixelBytes = stride * static_cast<size_t>(height);
+    const size_t totalBytes = sizeof(BITMAPV5HEADER) + pixelBytes;
+
+    if (SUCCEEDED(hr) &&
+        width > 0 &&
+        height > 0 &&
+        stride <= MAXDWORD &&
+        pixelBytes <= MAXDWORD &&
+        totalBytes <= static_cast<size_t>(MAXDWORD))
+    {
+        dibOut = GlobalAlloc(GMEM_MOVEABLE, totalBytes);
+        if (!dibOut)
+        {
+            hr = E_OUTOFMEMORY;
+        }
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        auto* memory = static_cast<uint8_t*>(GlobalLock(dibOut));
+        if (!memory)
+        {
+            hr = E_FAIL;
+        }
+        else
+        {
+            auto* header = reinterpret_cast<BITMAPV5HEADER*>(memory);
+            ZeroMemory(header, sizeof(*header));
+            header->bV5Size = sizeof(BITMAPV5HEADER);
+            header->bV5Width = static_cast<LONG>(width);
+            header->bV5Height = -static_cast<LONG>(height);
+            header->bV5Planes = 1;
+            header->bV5BitCount = 32;
+            header->bV5Compression = BI_BITFIELDS;
+            header->bV5SizeImage = static_cast<DWORD>(pixelBytes);
+            header->bV5RedMask = 0x00FF0000;
+            header->bV5GreenMask = 0x0000FF00;
+            header->bV5BlueMask = 0x000000FF;
+            header->bV5AlphaMask = 0xFF000000;
+            header->bV5CSType = LCS_sRGB;
+
+            BYTE* pixels = memory + sizeof(BITMAPV5HEADER);
+            hr = converter->CopyPixels(
+                nullptr,
+                static_cast<UINT>(stride),
+                static_cast<UINT>(pixelBytes),
+                pixels);
+            GlobalUnlock(dibOut);
+        }
+    }
+
+    if (converter) converter->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (stream) stream->Release();
+
+    if (FAILED(hr) && dibOut)
+    {
+        GlobalFree(dibOut);
+        dibOut = nullptr;
+    }
+
+    return SUCCEEDED(hr) && dibOut != nullptr;
+}
+
+HGLOBAL CopyBytesToGlobal(const uint8_t* bytes, size_t size)
+{
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!memory)
+    {
+        return nullptr;
+    }
+
+    void* target = GlobalLock(memory);
+    if (!target)
+    {
+        GlobalFree(memory);
+        return nullptr;
+    }
+
+    std::memcpy(target, bytes, size);
+    GlobalUnlock(memory);
+    return memory;
+}
+
+bool PutPngOnClipboard(const uint8_t* png, size_t pngSize)
+{
+    HGLOBAL dib = nullptr;
+    if (!DecodePngToDibV5(png, pngSize, dib))
+    {
+        return false;
+    }
+
+    HGLOBAL pngGlobal = CopyBytesToGlobal(png, pngSize);
+    const UINT pngFormat = RegisterClipboardFormatW(L"PNG");
+
+    if (!OpenClipboard(gMainWindow))
+    {
+        GlobalFree(dib);
+        if (pngGlobal) GlobalFree(pngGlobal);
+        return false;
+    }
+
+    gIgnoreNextClipboardUpdate.store(true, std::memory_order_relaxed);
+    EmptyClipboard();
+
+    const bool dibSet = SetClipboardData(CF_DIBV5, dib) != nullptr;
+    if (!dibSet)
+    {
+        GlobalFree(dib);
+    }
+
+    bool pngSet = false;
+    if (pngGlobal && pngFormat != 0)
+    {
+        pngSet = SetClipboardData(pngFormat, pngGlobal) != nullptr;
+        if (!pngSet)
+        {
+            GlobalFree(pngGlobal);
+        }
+    }
+    else if (pngGlobal)
+    {
+        GlobalFree(pngGlobal);
+    }
+
+    CloseClipboard();
+    return dibSet || pngSet;
+}
+
+bool SendPngToIpad(const std::vector<uint8_t>& png)
+{
+    const SOCKET socket = gWebSocketClient.load();
+    if (socket == INVALID_SOCKET || png.empty())
+    {
+        return false;
+    }
+
+    std::lock_guard lock(gWebSocketSendMutex);
+    return SendWebSocketFrameBytes(
+        socket,
+        0x2,
+        png.data(),
+        png.size());
+}
+
+void SendClipboardToIpad()
+{
+    std::vector<uint8_t> png;
+    if (!CaptureClipboardPng(png))
+    {
+        PostStatus(L"Clipboard does not contain a bitmap image.");
+        return;
+    }
+
+    if (!SendPngToIpad(png))
+    {
+        PostStatus(L"Could not send clipboard image. Is the iPad connected?");
+        return;
+    }
+
+    PostStatus(
+        L"Sent clipboard image to iPad for markup (" +
+        std::to_wstring(png.size() / 1024) +
+        L" KB).");
 }
 
 HWND TopLevelWindowAtPoint(POINT point)
@@ -1034,6 +1462,7 @@ void ProcessInputMessage(const std::string& message)
 
 void WebSocketLoop(SOCKET socket)
 {
+    gWebSocketClient.store(socket);
     PostStatus(L"iPad/browser connected. Input is live.");
 
     while (gRunning.load())
@@ -1072,7 +1501,7 @@ void WebSocketLoop(SOCKET socket)
             }
         }
 
-        if (length > 64 * 1024)
+        if (length > 32ull * 1024ull * 1024ull)
         {
             break;
         }
@@ -1100,14 +1529,20 @@ void WebSocketLoop(SOCKET socket)
 
         if (opcode == 0x8)
         {
-            SendWebSocketFrame(socket, 0x8, {});
+            {
+                std::lock_guard lock(gWebSocketSendMutex);
+                SendWebSocketFrame(socket, 0x8, {});
+            }
             break;
         }
         if (opcode == 0x9)
         {
-            if (!SendWebSocketFrame(socket, 0xA, payload))
             {
-                break;
+                std::lock_guard lock(gWebSocketSendMutex);
+                if (!SendWebSocketFrame(socket, 0xA, payload))
+                {
+                    break;
+                }
             }
             continue;
         }
@@ -1115,6 +1550,24 @@ void WebSocketLoop(SOCKET socket)
         {
             ProcessInputMessage(payload);
         }
+        else if (opcode == 0x2)
+        {
+            if (PutPngOnClipboard(
+                    reinterpret_cast<const uint8_t*>(payload.data()),
+                    payload.size()))
+            {
+                PostStatus(L"Marked-up image copied back to the Windows clipboard.");
+            }
+            else
+            {
+                PostStatus(L"Could not decode the marked-up PNG from iPad.");
+            }
+        }
+    }
+
+    if (gWebSocketClient.load() == socket)
+    {
+        gWebSocketClient.store(INVALID_SOCKET);
     }
 
     {
@@ -1776,22 +2229,41 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             255, 87, 415, 20,
             hwnd, nullptr, nullptr, nullptr);
 
+        HWND sendClipboard = CreateWindowExW(
+            0, L"BUTTON", L"Send Clipboard",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            20, 120, 125, 28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SEND_CLIPBOARD_BUTTON)),
+            nullptr,
+            nullptr);
+
+        gAutoClipboardCheck = CreateWindowExW(
+            0, L"BUTTON", L"Auto-send clipboard images",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+            160, 122, 220, 24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_AUTO_CLIPBOARD_CHECK)),
+            nullptr,
+            nullptr);
+        SendMessageW(gAutoClipboardCheck, BM_SETCHECK, BST_CHECKED, 0);
+
         HWND urlLabel = CreateWindowExW(
             0, L"STATIC", L"Open this on the iPad (same LAN):",
             WS_CHILD | WS_VISIBLE,
-            20, 126, 260, 20,
+            20, 164, 260, 20,
             hwnd, nullptr, nullptr, nullptr);
 
         gUrlText = CreateWindowExW(
             0, L"STATIC", L"Starting server...",
             WS_CHILD | WS_VISIBLE,
-            20, 150, 650, 24,
+            20, 188, 650, 24,
             hwnd, nullptr, nullptr, nullptr);
 
         gStatusText = CreateWindowExW(
             0, L"STATIC", L"Starting...",
             WS_CHILD | WS_VISIBLE,
-            20, 190, 650, 44,
+            20, 228, 650, 44,
             hwnd, nullptr, nullptr, nullptr);
 
         ApplyDefaultFont(label);
@@ -1800,10 +2272,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         ApplyDefaultFont(selectZone);
         ApplyDefaultFont(clearZone);
         ApplyDefaultFont(gZoneText);
+        ApplyDefaultFont(sendClipboard);
+        ApplyDefaultFont(gAutoClipboardCheck);
         ApplyDefaultFont(urlLabel);
         ApplyDefaultFont(gUrlText);
         ApplyDefaultFont(gStatusText);
 
+        AddClipboardFormatListener(hwnd);
         SetTimer(hwnd, ID_ZONE_TRACK_TIMER, 100, nullptr);
         return 0;
     }
@@ -1831,7 +2306,36 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             PostStatus(L"Input zone cleared. Mapping uses the full target client area.");
             return 0;
         }
+        if (LOWORD(wParam) == ID_SEND_CLIPBOARD_BUTTON && HIWORD(wParam) == BN_CLICKED)
+        {
+            SendClipboardToIpad();
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_AUTO_CLIPBOARD_CHECK && HIWORD(wParam) == BN_CLICKED)
+        {
+            const LRESULT checked = SendMessageW(gAutoClipboardCheck, BM_GETCHECK, 0, 0);
+            gAutoSendClipboard.store(checked == BST_CHECKED, std::memory_order_relaxed);
+            PostStatus(
+                checked == BST_CHECKED
+                    ? L"Automatic clipboard image markup enabled."
+                    : L"Automatic clipboard image markup disabled.");
+            return 0;
+        }
         break;
+
+    case WM_CLIPBOARDUPDATE:
+        if (gIgnoreNextClipboardUpdate.exchange(false, std::memory_order_relaxed))
+        {
+            return 0;
+        }
+        if (gAutoSendClipboard.load(std::memory_order_relaxed) &&
+            (IsClipboardFormatAvailable(CF_BITMAP) ||
+             IsClipboardFormatAvailable(CF_DIBV5) ||
+             IsClipboardFormatAvailable(CF_DIB)))
+        {
+            SendClipboardToIpad();
+        }
+        return 0;
 
     case WM_TIMER:
         if (wParam == ID_ZONE_TRACK_TIMER)
@@ -1852,8 +2356,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         HWND refresh = GetDlgItem(hwnd, ID_REFRESH_BUTTON);
         MoveWindow(refresh, std::max(20, width - 120), 44, 100, 28, TRUE);
         MoveWindow(gZoneText, 255, 87, std::max(100, width - 275), 20, TRUE);
-        MoveWindow(gUrlText, 20, 150, std::max(100, width - 40), 24, TRUE);
-        MoveWindow(gStatusText, 20, 190, std::max(100, width - 40), 44, TRUE);
+        MoveWindow(gUrlText, 20, 188, std::max(100, width - 40), 24, TRUE);
+        MoveWindow(gStatusText, 20, 228, std::max(100, width - 40), 44, TRUE);
         return 0;
     }
 
@@ -1869,6 +2373,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
 
     case WM_DESTROY:
+        RemoveClipboardFormatListener(hwnd);
         KillTimer(hwnd, ID_ZONE_TRACK_TIMER);
         DestroyZoneSelector();
         DestroyZoneOutline();
@@ -1884,6 +2389,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 {
     gInstance = instance;
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     RefreshVirtualDesktopGeometry();
 
@@ -1932,7 +2438,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         720,
-        320,
+        360,
         nullptr,
         nullptr,
         instance,
@@ -1991,6 +2497,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     {
         DestroySyntheticPointerDevice(gPenDevice);
         gPenDevice = nullptr;
+    }
+
+    if (gWicFactory)
+    {
+        gWicFactory->Release();
+        gWicFactory = nullptr;
+    }
+
+    if (SUCCEEDED(comResult))
+    {
+        CoUninitialize();
     }
 
     return 0;

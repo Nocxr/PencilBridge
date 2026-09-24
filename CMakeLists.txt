@@ -21,7 +21,9 @@ target_compile_definitions(PencilBridge PRIVATE
 target_link_libraries(PencilBridge PRIVATE
     bcrypt
     crypt32
+    ole32
     user32
+    windowscodecs
     ws2_32
 )
 

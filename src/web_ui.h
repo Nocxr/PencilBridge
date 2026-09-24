@@ -133,6 +133,55 @@ input[type=checkbox] { width: 20px; height: 20px; }
 }
 #cursor::before { width: 1px; height: 38px; left: 11px; top: -8px; }
 #cursor::after { width: 38px; height: 1px; top: 11px; left: -8px; }
+#markupView {
+    display: none;
+    flex: 1 1 auto;
+    min-height: 0;
+    flex-direction: column;
+    background: #0d0f13;
+}
+.markup-toolbar {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid #2a2e36;
+    background: #171a20;
+}
+.markup-toolbar button {
+    border: 1px solid #3a414d;
+    border-radius: 7px;
+    background: #20252d;
+    color: #e4e7ec;
+    padding: 7px 11px;
+    font: inherit;
+}
+.markup-toolbar input[type=color] {
+    width: 42px;
+    height: 32px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+}
+.markup-toolbar input[type=range] { width: 130px; }
+#markupStage {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 10px;
+}
+#markupCanvas {
+    display: block;
+    max-width: none;
+    max-height: none;
+    background: #fff;
+    box-shadow: 0 8px 28px rgba(0,0,0,.38);
+    touch-action: none;
+}
 #gestureToast {
     position: absolute;
     left: 50%;
@@ -202,6 +251,21 @@ input[type=checkbox] { width: 20px; height: 20px; }
     <div class="metric"><b>Position / stroke</b><span id="position">0.000, 0.000</span></div>
 </div>
 
+<section id="markupView">
+    <div class="markup-toolbar">
+        <strong>Markup</strong>
+        <input id="markupColor" type="color" value="#ff3b30" aria-label="Markup color">
+        <label>Size <input id="markupSize" type="range" min="2" max="28" step="1" value="7"></label>
+        <button id="markupClear" type="button">Clear Markup</button>
+        <div class="spacer"></div>
+        <button id="markupClose" type="button">Close</button>
+        <button id="markupSend" type="button">Send Back</button>
+    </div>
+    <div id="markupStage">
+        <canvas id="markupCanvas"></canvas>
+    </div>
+</section>
+
 <main id="pad" aria-label="Pencil input surface">
     <div id="cursor"></div>
     <div id="gestureToast"></div>
@@ -228,6 +292,14 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var cursor = document.getElementById('cursor');
     var pressureText = document.getElementById('pressure');
     var gestureToast = document.getElementById('gestureToast');
+    var markupView = document.getElementById('markupView');
+    var markupStage = document.getElementById('markupStage');
+    var markupCanvas = document.getElementById('markupCanvas');
+    var markupColor = document.getElementById('markupColor');
+    var markupSize = document.getElementById('markupSize');
+    var markupClear = document.getElementById('markupClear');
+    var markupClose = document.getElementById('markupClose');
+    var markupSend = document.getElementById('markupSend');
 
     var socket = null;
     var reconnectTimer = null;
@@ -254,6 +326,11 @@ input[type=checkbox] { width: 20px; height: 20px; }
     var GESTURE_MAX_MS = 420;
     var GESTURE_MOVE_PX = 28;
     var FINGER_MOUSE_DELAY_MS = 120;
+
+    var markupImage = null;
+    var markupDrawing = false;
+    var markupLastX = 0;
+    var markupLastY = 0;
 
     function loadNumber(key, fallback) {
         var value = Number(localStorage.getItem(key));
@@ -318,6 +395,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
 
         try {
             socket = new WebSocket('ws://' + location.host + '/ws');
+            socket.binaryType = 'arraybuffer';
         } catch (error) {
             setConnection(false, 'Connection failed');
             reconnectTimer = setTimeout(connect, 1200);
@@ -336,7 +414,165 @@ input[type=checkbox] { width: 20px; height: 20px; }
         socket.addEventListener('error', function () {
             setConnection(false, 'Connection error');
         });
+
+        socket.addEventListener('message', function (event) {
+            if (typeof event.data === 'string') {
+                return;
+            }
+            openMarkupImage(event.data);
+        });
     }
+
+
+    function fitMarkupCanvas() {
+        if (!markupCanvas.width || !markupCanvas.height || markupView.style.display === 'none') {
+            return;
+        }
+        var rect = markupStage.getBoundingClientRect();
+        var scale = Math.min(
+            Math.max(1, rect.width - 20) / markupCanvas.width,
+            Math.max(1, rect.height - 20) / markupCanvas.height,
+            1);
+        markupCanvas.style.width = Math.max(1, markupCanvas.width * scale) + 'px';
+        markupCanvas.style.height = Math.max(1, markupCanvas.height * scale) + 'px';
+    }
+
+    function redrawMarkupBase() {
+        if (!markupImage) {
+            return;
+        }
+        var ctx = markupCanvas.getContext('2d');
+        ctx.clearRect(0, 0, markupCanvas.width, markupCanvas.height);
+        ctx.drawImage(markupImage, 0, 0, markupCanvas.width, markupCanvas.height);
+    }
+
+    function openMarkupImage(buffer) {
+        var blob = new Blob([buffer], { type: 'image/png' });
+        var url = URL.createObjectURL(blob);
+        var image = new Image();
+
+        image.onload = function () {
+            URL.revokeObjectURL(url);
+            markupImage = image;
+            markupCanvas.width = image.naturalWidth;
+            markupCanvas.height = image.naturalHeight;
+            redrawMarkupBase();
+            pad.style.display = 'none';
+            markupView.style.display = 'flex';
+            requestAnimationFrame(fitMarkupCanvas);
+            showGestureToast('CLIP READY');
+        };
+
+        image.onerror = function () {
+            URL.revokeObjectURL(url);
+            showGestureToast('IMAGE ERROR');
+        };
+
+        image.src = url;
+    }
+
+    function closeMarkup() {
+        markupDrawing = false;
+        markupView.style.display = 'none';
+        pad.style.display = '';
+        refreshPadRect();
+    }
+
+    function markupPoint(event) {
+        var rect = markupCanvas.getBoundingClientRect();
+        return {
+            x: (event.clientX - rect.left) * markupCanvas.width / Math.max(1, rect.width),
+            y: (event.clientY - rect.top) * markupCanvas.height / Math.max(1, rect.height)
+        };
+    }
+
+    function drawMarkupSegment(event, fromX, fromY, toX, toY) {
+        var ctx = markupCanvas.getContext('2d');
+        var pressure = Math.max(0.15, Number(event.pressure || 0.5));
+        ctx.strokeStyle = markupColor.value;
+        ctx.lineWidth = Number(markupSize.value) * (0.55 + pressure * 0.9);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ctx.moveTo(fromX, fromY);
+        ctx.lineTo(toX, toY);
+        ctx.stroke();
+    }
+
+    markupCanvas.addEventListener('pointerdown', function (event) {
+        if (event.pointerType !== 'pen') {
+            return;
+        }
+        event.preventDefault();
+        var point = markupPoint(event);
+        markupDrawing = true;
+        markupLastX = point.x;
+        markupLastY = point.y;
+        try { markupCanvas.setPointerCapture(event.pointerId); } catch (_) {}
+    }, { passive: false });
+
+    markupCanvas.addEventListener('pointermove', function (event) {
+        if (!markupDrawing || event.pointerType !== 'pen') {
+            return;
+        }
+        event.preventDefault();
+
+        var samples = (typeof event.getCoalescedEvents === 'function')
+            ? event.getCoalescedEvents()
+            : [];
+        if (!samples || samples.length === 0) {
+            samples = [event];
+        }
+
+        for (var i = 0; i < samples.length; ++i) {
+            var point = markupPoint(samples[i]);
+            drawMarkupSegment(
+                samples[i],
+                markupLastX,
+                markupLastY,
+                point.x,
+                point.y);
+            markupLastX = point.x;
+            markupLastY = point.y;
+        }
+    }, { passive: false });
+
+    function endMarkupStroke(event) {
+        if (!markupDrawing || event.pointerType !== 'pen') {
+            return;
+        }
+        event.preventDefault();
+        markupDrawing = false;
+        try { markupCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
+    }
+
+    markupCanvas.addEventListener('pointerup', endMarkupStroke, { passive: false });
+    markupCanvas.addEventListener('pointercancel', endMarkupStroke, { passive: false });
+
+    markupClear.addEventListener('click', function () {
+        redrawMarkupBase();
+        showGestureToast('CLEARED');
+    });
+
+    markupClose.addEventListener('click', closeMarkup);
+
+    markupSend.addEventListener('click', function () {
+        if (!socket || socket.readyState !== WebSocket.OPEN || !markupCanvas.width) {
+            showGestureToast('NOT CONNECTED');
+            return;
+        }
+
+        markupCanvas.toBlob(function (blob) {
+            if (!blob) {
+                showGestureToast('EXPORT ERROR');
+                return;
+            }
+            blob.arrayBuffer().then(function (buffer) {
+                socket.send(buffer);
+                showGestureToast('SENT TO PC');
+            });
+        }, 'image/png');
+    });
 
     function refreshPadRect() {
         padRect = pad.getBoundingClientRect();
@@ -749,7 +985,10 @@ input[type=checkbox] { width: 20px; height: 20px; }
         requestAnimationFrame(telemetryFrame);
     }
 
-    window.addEventListener('resize', refreshPadRect);
+    window.addEventListener('resize', function () {
+        refreshPadRect();
+        fitMarkupCanvas();
+    });
     window.addEventListener('orientationchange', function () {
         setTimeout(refreshPadRect, 50);
     });
