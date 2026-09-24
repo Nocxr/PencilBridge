@@ -59,6 +59,22 @@ bool gPenInRange = false;
 POINT gLastPenScreenPoint{};
 int gLastPenTiltX = 0;
 int gLastPenTiltY = 0;
+
+struct TargetGeometry
+{
+    HWND target = nullptr;
+    POINT origin{};
+    int width = 0;
+    int height = 0;
+    bool valid = false;
+};
+
+TargetGeometry gPenTargetGeometry;
+std::atomic<int> gVirtualDesktopX{0};
+std::atomic<int> gVirtualDesktopY{0};
+std::atomic<int> gVirtualDesktopWidth{1};
+std::atomic<int> gVirtualDesktopHeight{1};
+
 bool gTouchDown = false;
 int gActiveTouchPointer = -1;
 
@@ -479,17 +495,18 @@ bool PointBelongsToTarget(POINT point, HWND target)
     return TopLevelWindowAtPoint(point) == target;
 }
 
-bool MapToTarget(double normalizedX, double normalizedY, POINT& outPoint, HWND& outTarget)
+bool CaptureTargetGeometry(HWND target, TargetGeometry& geometry)
 {
-    HWND target = gTargetWindow.load();
     if (!target || !IsWindow(target) || !IsWindowVisible(target))
     {
+        geometry.valid = false;
         return false;
     }
 
     RECT client{};
     if (!GetClientRect(target, &client))
     {
+        geometry.valid = false;
         return false;
     }
 
@@ -497,11 +514,33 @@ bool MapToTarget(double normalizedX, double normalizedY, POINT& outPoint, HWND& 
     const int height = client.bottom - client.top;
     if (width <= 1 || height <= 1)
     {
+        geometry.valid = false;
         return false;
     }
 
     POINT origin{0, 0};
     if (!ClientToScreen(target, &origin))
+    {
+        geometry.valid = false;
+        return false;
+    }
+
+    geometry.target = target;
+    geometry.origin = origin;
+    geometry.width = width;
+    geometry.height = height;
+    geometry.valid = true;
+    return true;
+}
+
+bool MapWithGeometry(
+    const TargetGeometry& geometry,
+    double normalizedX,
+    double normalizedY,
+    POINT& outPoint,
+    HWND& outTarget)
+{
+    if (!geometry.valid || !geometry.target)
     {
         return false;
     }
@@ -509,10 +548,25 @@ bool MapToTarget(double normalizedX, double normalizedY, POINT& outPoint, HWND& 
     normalizedX = std::clamp(normalizedX, 0.0, 1.0);
     normalizedY = std::clamp(normalizedY, 0.0, 1.0);
 
-    outPoint.x = origin.x + static_cast<LONG>(std::lround(normalizedX * static_cast<double>(width - 1)));
-    outPoint.y = origin.y + static_cast<LONG>(std::lround(normalizedY * static_cast<double>(height - 1)));
-    outTarget = target;
+    outPoint.x =
+        geometry.origin.x +
+        static_cast<LONG>(std::lround(normalizedX * static_cast<double>(geometry.width - 1)));
+    outPoint.y =
+        geometry.origin.y +
+        static_cast<LONG>(std::lround(normalizedY * static_cast<double>(geometry.height - 1)));
+    outTarget = geometry.target;
     return true;
+}
+
+bool MapToTarget(double normalizedX, double normalizedY, POINT& outPoint, HWND& outTarget)
+{
+    TargetGeometry geometry;
+    if (!CaptureTargetGeometry(gTargetWindow.load(), geometry))
+    {
+        return false;
+    }
+
+    return MapWithGeometry(geometry, normalizedX, normalizedY, outPoint, outTarget);
 }
 
 struct InputEvent
@@ -526,6 +580,32 @@ struct InputEvent
     int tiltY = 0;
     int pointerId = 0;
 };
+
+bool MapPenToTarget(
+    const InputEvent& event,
+    POINT& outPoint,
+    HWND& outTarget)
+{
+    const HWND selectedTarget = gTargetWindow.load();
+
+    if (event.phase == 'd' ||
+        !gPenDown ||
+        !gPenTargetGeometry.valid ||
+        gPenTargetGeometry.target != selectedTarget)
+    {
+        if (!CaptureTargetGeometry(selectedTarget, gPenTargetGeometry))
+        {
+            return false;
+        }
+    }
+
+    return MapWithGeometry(
+        gPenTargetGeometry,
+        event.x,
+        event.y,
+        outPoint,
+        outTarget);
+}
 
 bool ParseDouble(const std::string& text, double& value)
 {
@@ -591,27 +671,32 @@ bool ParseInputEvent(const std::string& message, InputEvent& event)
     return true;
 }
 
+void RefreshVirtualDesktopGeometry()
+{
+    gVirtualDesktopX.store(GetSystemMetrics(SM_XVIRTUALSCREEN), std::memory_order_relaxed);
+    gVirtualDesktopY.store(GetSystemMetrics(SM_YVIRTUALSCREEN), std::memory_order_relaxed);
+    gVirtualDesktopWidth.store(
+        std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+        std::memory_order_relaxed);
+    gVirtualDesktopHeight.store(
+        std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN)),
+        std::memory_order_relaxed);
+}
+
 POINT ToSyntheticPenPoint(POINT screenPoint)
 {
-    const int virtualX = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int virtualY = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    const int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const int virtualX = gVirtualDesktopX.load(std::memory_order_relaxed);
+    const int virtualY = gVirtualDesktopY.load(std::memory_order_relaxed);
+    const int virtualWidth = gVirtualDesktopWidth.load(std::memory_order_relaxed);
+    const int virtualHeight = gVirtualDesktopHeight.load(std::memory_order_relaxed);
 
     POINT result{
         screenPoint.x - virtualX,
         screenPoint.y - virtualY
     };
 
-    if (virtualWidth > 0)
-    {
-        result.x = std::clamp<LONG>(result.x, 0, virtualWidth - 1);
-    }
-    if (virtualHeight > 0)
-    {
-        result.y = std::clamp<LONG>(result.y, 0, virtualHeight - 1);
-    }
-
+    result.x = std::clamp<LONG>(result.x, 0, virtualWidth - 1);
+    result.y = std::clamp<LONG>(result.y, 0, virtualHeight - 1);
     return result;
 }
 
@@ -757,6 +842,7 @@ void InjectPen(const InputEvent& event, POINT point, HWND target)
 
         gPenDown = false;
         gPenInRange = false;
+        gPenTargetGeometry.valid = false;
     }
 }
 
@@ -821,17 +907,21 @@ void ProcessInputMessage(const std::string& message)
 
     POINT point{};
     HWND target = nullptr;
-    if (!MapToTarget(event.x, event.y, point, target))
-    {
-        return;
-    }
 
     if (event.device == 'p')
     {
+        if (!MapPenToTarget(event, point, target))
+        {
+            return;
+        }
         InjectPen(event, point, target);
     }
     else if (event.device == 't')
     {
+        if (!MapToTarget(event.x, event.y, point, target))
+        {
+            return;
+        }
         InjectTouchMouse(event, point, target);
     }
 }
@@ -946,6 +1036,7 @@ void WebSocketLoop(SOCKET socket)
         }
         gPenDown = false;
         gPenInRange = false;
+        gPenTargetGeometry.valid = false;
     }
 
     PostStatus(L"Client disconnected. Waiting for iPad/browser...");
@@ -1196,6 +1287,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
         break;
 
+    case WM_DISPLAYCHANGE:
+        RefreshVirtualDesktopGeometry();
+        return 0;
+
     case WM_SIZE:
     {
         const int width = LOWORD(lParam);
@@ -1231,6 +1326,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    RefreshVirtualDesktopGeometry();
 
     gPenDevice = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT);
 

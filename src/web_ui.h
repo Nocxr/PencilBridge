@@ -407,21 +407,7 @@ input[type=checkbox] { width: 20px; height: 20px; }
         }
         event.preventDefault();
 
-        var samples = (typeof event.getCoalescedEvents === 'function')
-            ? event.getCoalescedEvents()
-            : [];
-
-        if (!samples || samples.length === 0) {
-            samples = [event];
-        }
-
-        for (var i = 0; i < samples.length; ++i) {
-            var sample = samples[i];
-            if (sample.pointerType === 'pen' && !penActive) {
-                continue;
-            }
-            sendEvent(sample, 'm');
-        }
+        sendEvent(event, 'm');
     }, { passive: false });
 
     pad.addEventListener('pointerup', function (event) {
